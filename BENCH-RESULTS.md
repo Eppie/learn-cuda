@@ -194,26 +194,55 @@ Online softmax at 1008 GB/s = peak DRAM. Fused softmax beats unfused by 2.2×. G
 
 ## M10 — FlashAttention optimization ladder (D=64, single-head)
 
-| N | naive (TFLOPs) | 10.0 one-thread/row | 10.1 warp-coop FP32 | 10.2 WMMA FP16 | **10.3 cp.async + WMMA** |
-|---|---|---|---|---|---|
-| 2048 | 1.88 | 1.61 | 2.13 | 5.17 | **6.39** |
-| 4096 | 1.88 | 3.24 | 4.32 | 10.43 | **13.03** |
-| 8192 | 1.81 | 6.84 | 9.26 | 22.47 | **28.01** |
+| N | naive | 10.0 thread/row | 10.1 warp-coop FP32 | 10.2 WMMA FP16 | 10.3 cp.async+WMMA | **10.4 raw mma.sync** |
+|---|---|---|---|---|---|---|
+| 2048 | 1.88 | 1.61 | 2.13 | 5.17 | 6.39 | **13.96** |
+| 4096 | 1.90 | 3.24 | 4.32 | 10.44 | 13.03 | **28.54** |
+| 8192 | 1.77 | 6.56 | 8.90 | 21.61 | 26.46 | **59.36** |
 
-10.0 → 10.3 = **4.1× speedup at N=8192**. The full ladder progression:
-- WMMA tensor cores get the dot-product parallelism for free (3.3× over FP32).
-- `cp.async` double-buffering on top of WMMA hides one tile's load latency (~1.25-1.32× over 10.2).
+(TFLOPs/s, min-of-N on RTX 4090, idle GPU. Run-to-run noise at the top of
+the ladder is ~3% — N=8192 10.4 sits in the 58-62 TF/s band depending on
+host scheduler state.)
+
+**10.0 → 10.4 = 9× speedup at N=8192.** Reaching **~37% of cuBLAS hgemm peak**
+(159 TF/s) in pedagogical code is a strong result. The remaining gap is
+CUTLASS-quality scheduling, more aggressive `ldmatrix` usage (A12 used manual
+`__half2` packing for clarity; `ldmatrix.x2.trans` for the V-as-B load would
+recover ~10-15%), and deeper pipelining (STAGES=3/4 needs
+`cudaFuncSetAttribute` opt-in to sm_89's 100 KB shared-mem limit).
+
+**The big jumps explained:**
+- 10.0 → 10.2 (one-thread → WMMA): **3.3×**. Tensor cores get the dot-product
+  parallelism for free; FP32 (10.0/10.1) leaves it on the table because the
+  FMA pipe is already saturated.
+- 10.2 → 10.3 (add cp.async): **1.25×**. Hides one tile's load latency.
+- 10.3 → 10.4 (WMMA → raw mma.sync): **2.2×**. Eliminates WMMA's
+  opaque-fragment shared-memory round-trips: row softmax happens in
+  registers via `__shfl_xor_sync` within 4-lane groups (the documented
+  m16n8k16 layout makes this possible); the alpha-rescale of the O
+  accumulator happens per-lane in registers; the P→FP16 repack feeds the
+  next mma.sync directly with no shared-memory trip.
 
 Verify (vs naive reference at small sizes):
 - M10.0: max_abs=1.60e-7 (FP32 epsilon)
 - M10.1: max_abs=1.27e-7 at N=2048 (FP32 epsilon)
-- M10.2: max_abs=1.26e-5 at N=2048 (FP16 inputs; 400× margin under rel=2e-2 tolerance)
-- M10.3: max_abs=1.26e-5 at N=2048 (**bit-for-bit identical to M10.2** — cp.async is a pure perf optimization, no numerical change)
+- M10.2 / 10.3 / 10.4: max_abs=1.26e-5 at N=2048 — **bit-for-bit identical**
+  across all three FP16 kernels (400× margin under rel=2e-2 tolerance). The
+  cp.async (10.2 → 10.3) and mma.sync (10.3 → 10.4) changes are pure perf
+  transformations; the math is the same.
 
 **Honest engineering notes:**
 
-- M10.1 ("warp-cooperative dot product"): A10 tried the spec (lanes parallelize over D, butterfly reduction) and found it *underperformed* the simpler "bigger blocks for better K-tile amortization" at FP32 — shuffles cost more than FMAs save when the FMA pipe is already full. The pedagogical lesson in §7: "warp cooperation is a tensor-core trick, not an FP32 trick."
-- M10.3 at 28 TF/s (target was 28-30): with STAGES=2 we hide *one* tile's load latency; the remaining gap to cuBLAS hgemm (159 TF/s) is the per-iter softmax-on-fragments dance (store S → row reduce → write FP16 P → load P frag) and the O-rescale shared-memory round-trip — both are register-layout-opaque WMMA artefacts and won't move without raw `mma.sync`. STAGES=3/4 would need `cudaFuncSetAttribute` opt-in to the sm_89 100 KB shared-mem limit; left as documented future stretch.
+- M10.1 ("warp-cooperative dot product"): A10 tried the spec (lanes parallelize
+  over D, butterfly reduction) and found it *underperformed* the simpler
+  "bigger blocks for better K-tile amortization" at FP32 — shuffles cost more
+  than FMAs save when the FMA pipe is already saturated. The pedagogical
+  lesson in §7: "warp cooperation is a tensor-core trick, not an FP32 trick."
+- M10.4 V-as-B load is the slow path in the current implementation (4 scalar
+  `__half` reads per lane per mma, because V is row-major in shared but the
+  second mma.sync wants K^T-style col-major B). Replacing with
+  `ldmatrix.sync.aligned.m8n8.x2.trans` would recover ~10-15% — explicitly
+  documented as the next perf step.
 
 ## M11 — Low-latency
 

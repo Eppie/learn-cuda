@@ -2,10 +2,12 @@
 
 **Goal:** by the end of this module you should be able to (a) explain the
 *online softmax* recurrence and how it tiles, (b) implement a working
-FlashAttention forward pass in CUDA at three points along the optimization
-ladder — from "one thread per Q row" through warp-cooperative FP32 to a
-WMMA tensor-core kernel — and (c) describe the four common shape variants
-(MHA, causal, KV-cache, GQA) and the path from there to FlashAttention-2/3.
+FlashAttention forward pass in CUDA at five points along the optimization
+ladder — from "one thread per Q row" through warp-cooperative FP32, WMMA
+tensor cores, cp.async double-buffering, all the way to a raw `mma.sync`
+register-resident-softmax kernel at FlashAttention-2 shape perf — and (c)
+describe the four common shape variants (MHA, causal, KV-cache, GQA) and
+the path from there to FlashAttention-2/3.
 
 This module is the most algorithmically dense in the course. The *math* is
 all in §1-§4. The *engineering ladder* — actually optimizing the kernel for
@@ -270,7 +272,7 @@ the shared-memory round-trip is the price of that readability.
 ~160 TF/s cuBLAS hgemm peak. The remaining gap to 50% of peak is mostly
 (a) the O-scaling shared-memory round trip in step 4, (b) no `cp.async`
 overlap between K/V load and compute, (c) the WMMA fragment layout overhead
-that raw `mma.sync` would eliminate. (a) and (b) are 10.3.
+that raw `mma.sync` would eliminate. (b) is 10.3; (a) and (c) are 10.4.
 
 ## 9. Rung 10.3 — `cp.async` + WMMA
 
@@ -331,7 +333,7 @@ store/scale/load cycle per block — a small but free win.
 TF/s, on the low end of the 1.3–1.5× spec-projection). The gap to the
 projected 30 TF/s is the per-iter softmax-on-fragments dance and the
 O-rescale shared-memory round trip; both go away with raw `mma.sync`,
-which is the §11 Stretch exercise.
+which is what §10 (Rung 10.4) does.
 
 We use the legacy `__pipeline_memcpy_async` API from `<cuda_pipeline.h>`
 (emits `cp.async.cg.shared.global ..., 16, 16`), matching M08's
@@ -425,7 +427,7 @@ the simple "one thread per Q row" base (10.0) because the shape concern is
 independent of the speed concern, and because reading them next to the base
 is the clearest way to see exactly what's added.
 
-### 10.A Causal masking with tile-skip
+### 11.A Causal masking with tile-skip
 
 For autoregressive (GPT-style) models the score matrix is lower-triangular:
 `S[i, j] = -∞ if j > i`. The naive way is to apply the mask per-element inside
@@ -443,7 +445,7 @@ below the diagonal need no mask at all.
 
 See `flash_attention_causal` in `kernels.cuh`.
 
-### 10.B KV-cache (the inference-time form of FA)
+### 11.B KV-cache (the inference-time form of FA)
 
 At inference, after the prefill phase the model processes one new token at a
 time. Each step:
@@ -463,7 +465,7 @@ total wall-clock at scale. Real implementations split it further by the
 "paged" attention pattern (vLLM); we're showing the contiguous-cache form for
 clarity.
 
-### 10.C Grouped-Query Attention (GQA)
+### 11.C Grouped-Query Attention (GQA)
 
 Llama-2/3, Mistral, and most modern open-weight inference models use GQA: the
 number of query heads `H_q` is larger than the number of KV heads `H_kv`,
@@ -478,16 +480,16 @@ practice.
 Algorithmically GQA is identical to MHA — just a different head-index
 mapping. See `flash_attention_gqa` in `kernels.cuh`.
 
-### 10.D What about porting these to 10.2 (WMMA)?
+### 11.D What about porting these to 10.2 (WMMA)?
 
 Mechanical, not free. The MHA wrapper is one extra index calculation at the
 top of the kernel — straightforward. Causal needs the tile-skip *and* a
 per-tile mask: at WMMA granularity that means clobbering specific cells of
 `Ssm` after `store_matrix_sync` and before the row softmax, which fits
 cleanly into the existing dance. KV-cache and GQA are also pure index
-remapping. Recommended as the §11 stretch exercise.
+remapping. Recommended as the stretch exercise.
 
-## 11. Comparison: naive vs flash, and the ladder
+## 12. Comparison: naive vs flash, and the ladder
 
 `bench.cu` runs all rungs at `N ∈ {2048, 4096, 8192}, D = 64`:
 
@@ -498,6 +500,7 @@ remapping. Recommended as the §11 stretch exercise.
 | 10.1 flash     | same math, 4× rows per block                      | no             | 1 |
 | 10.2 flash     | tensor-core inner matmul + softmax-on-fragments   | no             | 1 |
 | 10.3 flash     | 10.2 + double-buffered cp.async K/V loads         | no             | 1 |
+| 10.4 flash     | raw `mma.sync` + register-resident softmax        | no             | 1 |
 
 At small N (2048) the naive version's S/P matrices fit in L2 (17 MB) and the
 wall-clock gap to flash is small. At `N = 8192` (256 MB S/P), naive blows out
@@ -516,9 +519,13 @@ applied to the *same* algorithm:
   exist; FA inner matmuls fit them perfectly. ~2.4× over 10.1 at N=8192.
 - 10.2 → 10.3: **overlap memory and compute.** The standard async-copy
   pattern from M08, applied on top of WMMA. ~1.27× over 10.2 at N=8192 in
-  practice (on the low end of the ~1.3–1.5× projection; closing the
-  remainder to peak now requires raw `mma.sync` to eliminate the O-rescale
-  shared-memory round trip — see the §11 Stretch).
+  practice (on the low end of the ~1.3–1.5× projection).
+- 10.3 → 10.4: **kill the softmax shared-memory round trip.** Switch from
+  opaque WMMA fragments to raw `mma.sync.m16n8k16` whose lane layout is
+  documented. Row softmax over S happens in registers via `__shfl_xor_sync`
+  in the 4-lane t-group; per-iteration O-rescale by α is now a plain
+  scalar multiply on a `float o_frag[8][4]` per lane. ~2.2× over 10.3 at
+  N=8192. This is the FA-2-shape kernel.
 
 ---
 
@@ -543,11 +550,18 @@ each runs a host-side reference at small sizes (B=2, H=4, N=128, D=64).
   budget). With `cudaFuncSetAttribute(.., cudaFuncAttributeMaxDynamicSharedMemorySize, ..)`
   to opt into the 100 KB-per-block limit on sm_89, STAGES=3 fits and may hide
   more of the K/V load latency. See M08 §3a for the deeper-pipeline pattern.
-- **Port the four shape variants to WMMA.** Take `flash_attention_wmma` and
-  add the MHA / causal / KV-cache / GQA overlays from §10. Causal at WMMA
-  granularity is the most interesting because the per-tile mask now applies
-  to the materialized `Ssm` between `store_matrix_sync` and the row-softmax
-  step.
+- **Port the four shape variants to WMMA or mma.sync.** Take `flash_attention_wmma`
+  (or `flash_attention_mma`) and add the MHA / causal / KV-cache / GQA overlays
+  from §11. Causal at WMMA granularity is the most interesting because the
+  per-tile mask now applies to the materialized `Ssm` between
+  `store_matrix_sync` and the row-softmax step. At raw `mma.sync` granularity,
+  the mask is a per-lane register guard right after Q·Kᵀ — even cleaner.
+- **`ldmatrix` for the 10.4 fragment loads.** 10.4 packs the A / B operand
+  registers by hand. Swapping the Q and K loads for `ldmatrix.sync.aligned.
+  m8n8.x4.shared.b16` and the V load for `ldmatrix.x2.trans.shared.b16` (M13
+  `ldmatrix_example.cu` for the syntax) is the standard FA-2 / CUTLASS shape.
+  Expect ~10-15% headroom on top of 10.4's 62 TF/s on this card, mostly from
+  the V transpose disappearing into a single hardware-fused load.
 - **FlashAttention-2 loop swap.** Swap the loop order so the outer loop is
   over the K/V tile and the inner is over the Q rows. The state machine
   becomes per-output-block instead of per-Q-row. ~2× faster than v1 in
@@ -557,11 +571,6 @@ each runs a host-side reference at small sizes (B=2, H=4, N=128, D=64).
   K/V index calculation.
 - **Sliding-window attention.** Mistral-style — like causal but with a
   window of the last W tokens. Adds another tile-skip case.
-- **Raw `mma.sync` flash.** Replace the WMMA wrapper with raw `mma.sync.
-  m16n8k16` (M07 v2_mma_sync style; M13 mma_sync_example for the lane-
-  element layout). The win is that `o_frag` becomes a normal float register
-  array, so step 4 of §8 (the O-scaling shared-memory round trip) goes away.
-  The cost is ~50 lines of fragment-packing PTX.
 
 ---
 
@@ -591,6 +600,13 @@ What to look at, by rung:
   Look at the `Memory Workload Analysis` view — the "Stall (Long Scoreboard)"
   metric, which is the "I'm waiting for a DRAM load" stall, should drop
   visibly. DRAM bandwidth utilization in the bench measured run goes up.
+- **10.4 vs 10.3**: Tensor Core utilization should jump sharply (~2×) —
+  the WMMA softmax-on-fragments and O-rescale shared-memory round-trips
+  are gone, so a much larger fraction of the kernel time is spent issuing
+  `mma.sync`. "Smem→Reg" traffic should drop substantially (no more O
+  store/load). The "Warp Stall" breakdown should show the dominant stall
+  source shift away from `__syncthreads`/`__syncwarp` toward MIO Throttle
+  (the per-iter V transposed load on `Vs_cur` is now the next bottleneck).
 - **causal**: at large N, "thread instructions executed" should be ~half of
   the non-causal kernel. If it isn't, the tile-skip isn't kicking in.
 
@@ -601,13 +617,15 @@ What to look at, by rung:
 - FlashAttention's win is that it avoids ever writing `S` and `P` to DRAM —
   *not* better asymptotic complexity. It's still O(N²·D) work; the
   bandwidth constant is ~2-3× smaller.
-- The optimization ladder (10.0 → 10.1 → 10.2 → 10.3) is the same kind of
-  ladder you saw in M06 (GEMM v0 → v6) and M08 (sync → cp.async). Same
-  techniques, different inner loop.
+- The optimization ladder (10.0 → 10.1 → 10.2 → 10.3 → 10.4) is the same
+  kind of ladder you saw in M06 (GEMM v0 → v6) and M08 (sync → cp.async).
+  Same techniques, different inner loop.
 - Tensor cores work great inside FA — but the **softmax** between the two
   matmuls is the awkward bit, because it needs row-wise access to the score
-  fragment whose layout is opaque under WMMA. Raw `mma.sync` makes this less
-  awkward; production kernels use it.
+  fragment whose layout is opaque under WMMA. Raw `mma.sync` makes this
+  fragment layout documented and per-lane addressable; that's what FA-2 and
+  CUTLASS use, and it's what 10.4 does — the rung that takes us from 28
+  TF/s (10.3) to 62 TF/s on this card.
 - The four shape variants (MHA / causal / KV-cache / GQA) are head-index and
   masking overlays on the same inner loop. Causal masking + tile-skip cuts
   inner work nearly in half for autoregressive models. Free.
