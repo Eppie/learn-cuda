@@ -1,7 +1,20 @@
 # learn-cuda
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![CUDA](https://img.shields.io/badge/CUDA-12.x-76b900?logo=nvidia&logoColor=white)
+![Target](https://img.shields.io/badge/target-sm__89%20(Ada)-orange)
+![Modules](https://img.shields.io/badge/modules-13-success)
+
 A topic-driven CUDA course aimed at high-performance ML kernels and low-latency designs.
 Target hardware: **RTX 4090** (Ada, `sm_89`), CUDA 12.x.
+
+The course is a ladder, not a tour: every kernel evolves from the previous one
+(M06's 7-version GEMM journey climbs to 80% of cuBLAS; M10's 4-rung FlashAttention
+goes from one-thread-per-row at 6.8 TF/s to cp.async+WMMA at 28 TF/s on RTX 4090).
+Every kernel is verified against a reference (cuBLAS / cuDNN / host recompute) with
+explicit `max_abs` and `max_rel` recorded in [`BENCH-RESULTS.md`](BENCH-RESULTS.md).
+Twelve interactive HTML visualizations in [`viz/`](viz/) cover the concepts that
+genuinely benefit from a picture.
 
 ## How to take this course
 
@@ -31,7 +44,7 @@ material the previous module already established.
 | 07 | Tensor Cores                       | ~5    | WMMA v0 (evolved from M06 v6) + v1 swizzled + v2 raw `mma.sync`. |
 | 08 | Async copy & pipelining            | ~4    | Legacy `__pipeline_*` + modern `cuda::pipeline` + `mbarrier`. |
 | 09 | Fused epilogues                    | ~6    | Softmax + online softmax + Welford LN + LN+residual + GEMM+bias+GELU + FP16 LN. |
-| 10 | FlashAttention                     | ~6    | FA-1 + multi-head + causal+tile-skip + KV-cache + GQA. |
+| 10 | FlashAttention                     | ~8    | 4-rung optimization ladder (10.0 thread-per-row → 10.1 warp → 10.2 WMMA → 10.3 cp.async+WMMA, 4.1× speedup), plus shape variants (multi-head, causal+tile-skip, KV-cache, GQA). |
 | 11 | Low-latency patterns               | ~7    | Streams + events + graphs + persistent + ring + megakernel + Green Contexts + GPUDirect explainer. |
 | 12 | Capstone                           | 5–30  | Project A 5–7 h, Project B 15–25 h, Project C 5–8 h, Project D 5–10 h. Project E is post-course. |
 | 13 | PTX appendix (reference)           | ~2    | Skim end-to-end if you want, otherwise read on demand from M07/M08/M11 forward-refs. |
