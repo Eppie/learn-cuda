@@ -1,12 +1,39 @@
 # Wave 2 follow-ups (deferred decisions and additions)
 
 > **What this file is:** the design-decision log from a substantial overhaul
-> pass on this course. Most items have already landed in the relevant module
-> READMEs; the genuinely-deferred work (M10.3 cp.async-flash implementation,
-> Mamba PROJECT-E, online-softmax shared-header lift) is called out
-> explicitly. Useful for understanding *why* parts of the curriculum are
-> structured the way they are; not necessary reading for someone taking the
-> course.
+> pass on this course. Useful for understanding *why* parts of the curriculum
+> are structured the way they are; not necessary reading for someone taking
+> the course.
+
+## Status (current)
+
+**Landed in Wave 2:**
+- M11 reframe around "eliminate launches" ladder (§B.2)
+- M11 megakernel section (§B.1)
+- M11 Green Contexts SM partitioning (§B.2)
+- M11 Beyond Ada / DSMEM forward-ref (§B.6)
+- Mamba TODOs in M05 / M09 / M10 / M12 (§D)
+- M12 `PROJECT-E.md` post-course Mamba spec (§D.4)
+- M07 / M11 / M13 cross-anchor cleanups (§E.4)
+- Top-level README "How to take this course" + time budget table
+- `STRETCH-ANSWERS.md`
+- `viz/` directory with 12 interactive HTML files
+- `BENCH-RESULTS.md` with measured numbers from a clean RTX 4090 sweep
+- **Online-softmax shared-header lift** to `common/online_softmax.cuh`
+  (§E.1) — M5 / M9 / M10's six non-WMMA kernels now share the same primitive
+- **M10 optimization ladder** — 10.0 → 10.1 → 10.2 WMMA → 10.3 cp.async+WMMA
+  (4.1× speedup from 6.84 → 28.01 TF/s at N=8192 single-head)
+
+**Deferred (post-course / future):**
+- PROJECT-E (Mamba inference megakernel) — spec only; implementation is
+  multi-week, post-course.
+- M10.4 (raw mma.sync flash) — in progress as of this writing.
+- Cosmetic subsection numbering (M07.0/.1/.2, M11.0/.1/...) — skipped as
+  low-value relative to risk of breaking cross-references.
+- M10.2's WMMA softmax-on-fragments dance — left inline; eliminating it
+  requires the M10.4 raw-mma.sync path.
+
+---
 
 ---
 
