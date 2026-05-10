@@ -152,17 +152,17 @@ The §3 algorithm is *the same* at every rung of this ladder. Only the
 thread-→-data mapping and the inner matmul implementation change. We deliver
 three working kernels and a stretch spec:
 
-| Rung   | Kernel                       | Inputs   | Inner matmul        | Headline N=8192 |
-|--------|------------------------------|----------|---------------------|-----------------|
-| 10.0   | `flash_attention`            | FP32     | per-thread scalar   | 6.5 TF/s        |
-| 10.1   | `flash_attention_warp`       | FP32     | per-thread scalar   | 9.2 TF/s        |
-| 10.2   | `flash_attention_wmma`       | FP16     | WMMA tensor-cores   | 22 TF/s         |
-| 10.3   | (stretch: cp.async + WMMA)   | FP16     | WMMA + double-buf   | ~30 TF/s target |
+| Rung   | Kernel                          | Inputs   | Inner matmul        | Headline N=8192 |
+|--------|---------------------------------|----------|---------------------|-----------------|
+| 10.0   | `flash_attention`               | FP32     | per-thread scalar   | 6.5 TF/s        |
+| 10.1   | `flash_attention_warp`          | FP32     | per-thread scalar   | 9.2 TF/s        |
+| 10.2   | `flash_attention_wmma`          | FP16     | WMMA tensor-cores   | 22 TF/s         |
+| 10.3   | `flash_attention_async_wmma`    | FP16     | WMMA + cp.async ×2  | 28 TF/s         |
 
 (Numbers are min-of-N timing on RTX 4090, single head, D=64; see
-`bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.2 is at
-~14% of peak — the softmax-on-fragments dance is the single biggest cost
-left, and 10.3 + raw mma.sync is what closes the rest of the gap.)
+`bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.3 is at
+~18% of peak — the softmax-on-fragments dance is now the single biggest
+cost left, and raw mma.sync is what closes the rest of the gap.)
 
 ### 5.1 The four shape variants
 
@@ -271,39 +271,71 @@ the shared-memory round-trip is the price of that readability.
 overlap between K/V load and compute, (c) the WMMA fragment layout overhead
 that raw `mma.sync` would eliminate. (a) and (b) are 10.3.
 
-## 9. Rung 10.3 — `cp.async` + WMMA (stretch)
+## 9. Rung 10.3 — `cp.async` + WMMA
 
-> No reference implementation. Detailed enough that a learner who has done
-> M08 (gemm_v1_async) and M10.2 should be able to write it.
+```c
+// kernels.cuh, flash_attention_async_wmma()
+// BR2 = 16, BC2 = 32, D2 = 64. WARPS_M10_2 = 4. STAGES = 2.
+// Block: 128 threads, BR2_BLOCK = 64 Q rows per block.
+// Shared mem ≈ 45.6 KB / block (fits the default 48 KB — no opt-in needed).
+```
 
 The 10.2 kernel has a hard barrier between "load K/V tile from DRAM" and
 "compute on K/V tile" — both happen in the same iteration of the outer loop,
 so the SM stalls for memory during the load and stalls for compute during
-the WMMA. M08's `cp.async` (or `cuda::pipeline`) overlaps the two:
+the WMMA. M08's `cp.async` (`gemm_v1_async`) overlaps the two; 10.3 does
+exactly that on top of 10.2.
 
-- Allocate **double-buffered** `Ks`, `Vs` in shared memory: two copies of
-  `BC2 × D2` halves each.
-- At `j = 0`: kick off the cp.async for stage 0.
-- For `j = 0 .. Tc-1`:
-  - If `j+1 < Tc`: kick off the cp.async for stage `(j+1) % 2`.
-  - `cp.async.wait_group` for stage `j % 2` (the one we need now).
-  - Run the §8 inner body using stage `j % 2`'s K/V buffers.
-- At the end, wait for all in-flight loads (in case the very last issue is
-  still pending) before writing back O.
+**Double-buffered shared memory.** Two copies of `BC2 × D2` halves each
+for K and V, indexed `Ks[STAGES][BC2*D2]` and `Vs[STAGES][BC2*D2]`. With
+`STAGES = 2` we pay an extra 8 KB on top of 10.2's ~38 KB — total ~45.6 KB,
+still under the default 48 KB per block, so no `cudaFuncSetAttribute` opt-in.
 
-What you should expect to gain:
+**Pipeline shape.** Same as M08's `gemm_v1_async`:
 
-- At N=8192, 10.2 spends roughly 30-50% of its time waiting on K/V tile
-  loads (depending on what the L2 cache decides to keep around). Hiding most
-  of that gives ~1.3-1.5× speedup.
-- The exact win is bounded by how well the 10.2 inner body fills the SM. If
-  you're already FMA-bound (which you're not at 14% of peak), `cp.async` is
-  ~free; if you're memory-bound, it's the whole gap.
+```
+issue_loads(K[0], V[0] -> Ks[0], Vs[0])
+__pipeline_commit()
 
-A modern variant uses `cuda::pipeline` (the C++ wrapper from M08); legacy is
-`cp.async.commit_group` / `cp.async.wait_group` PTX. M08's
-`08-async-copy/kernels.cuh::gemm_v1_async` is the closest reference structure
-in this course.
+for j in [0, Tc):
+    if j + 1 < Tc:
+        issue_loads(K[j+1], V[j+1] -> Ks[(j+1) % 2], Vs[(j+1) % 2])
+    __pipeline_commit()
+    __pipeline_wait_prior(STAGES - 1)   // = wait_prior(1): oldest commit done
+    __syncthreads()
+
+    // M10.2 inner body on Ks[j % 2], Vs[j % 2]:
+    //   Q · K^T via WMMA → S_frag
+    //   store → row-softmax → write FP16 P → shared
+    //   rescale O by alpha (shared-memory round trip)
+    //   P · V via WMMA → o_frag accumulator
+
+    __syncthreads()   // WAR fence — see M08 §3a comment
+```
+
+**Out-of-bounds handling.** Each cp.async transfer is 16 bytes (8 halves).
+For the final tile, rows past `N` would issue from out-of-bounds global
+addresses; instead we clamp the source row to `min(kcol, N-1)`, getting
+finite garbage. The post-softmax `Ssm[col >= N] = -INFINITY` mask zeroes the
+corresponding P columns, so the garbage Vs never reach the output. (The
+garbage must be finite, not NaN/inf, because `0 · NaN = NaN`.)
+
+**One micro-optimization** worth calling out: on iteration 0, the running
+`o_frag` is identically zero (`fill_fragment`) and `alpha == 0` (because
+`m_state == -INFINITY` is the identity), so the shared-memory round trip
+that rescales O by alpha is a no-op. Skipping it on iter 0 saves one
+store/scale/load cycle per block — a small but free win.
+
+**At runtime** this kernel hits ~28 TF/s at N=8192 (1.27× over 10.2's 22
+TF/s, on the low end of the 1.3–1.5× spec-projection). The gap to the
+projected 30 TF/s is the per-iter softmax-on-fragments dance and the
+O-rescale shared-memory round trip; both go away with raw `mma.sync`,
+which is the §11 Stretch exercise.
+
+We use the legacy `__pipeline_memcpy_async` API from `<cuda_pipeline.h>`
+(emits `cp.async.cg.shared.global ..., 16, 16`), matching M08's
+`gemm_v1_async`. The modern `cuda::pipeline` wrapper is functionally
+equivalent — see M08 §8.2 for the comparison.
 
 ## 10. The four shape variants
 
@@ -384,6 +416,7 @@ remapping. Recommended as the §11 stretch exercise.
 | 10.0 flash     | single fused kernel with online softmax, scalar   | no             | 1 |
 | 10.1 flash     | same math, 4× rows per block                      | no             | 1 |
 | 10.2 flash     | tensor-core inner matmul + softmax-on-fragments   | no             | 1 |
+| 10.3 flash     | 10.2 + double-buffered cp.async K/V loads         | no             | 1 |
 
 At small N (2048) the naive version's S/P matrices fit in L2 (17 MB) and the
 wall-clock gap to flash is small. At `N = 8192` (256 MB S/P), naive blows out
@@ -401,7 +434,10 @@ applied to the *same* algorithm:
 - 10.1 → 10.2: **switch precision + use the right hardware.** Tensor cores
   exist; FA inner matmuls fit them perfectly. ~2.4× over 10.1 at N=8192.
 - 10.2 → 10.3: **overlap memory and compute.** The standard async-copy
-  pattern from M08, applied on top of WMMA. Expected ~1.3-1.5×.
+  pattern from M08, applied on top of WMMA. ~1.27× over 10.2 at N=8192 in
+  practice (on the low end of the ~1.3–1.5× projection; closing the
+  remainder to peak now requires raw `mma.sync` to eliminate the O-rescale
+  shared-memory round trip — see the §11 Stretch).
 
 ---
 
@@ -422,8 +458,10 @@ each runs a host-side reference at small sizes (B=2, H=4, N=128, D=64).
 
 ### Stretch
 
-- **10.3 cp.async + WMMA.** Spec is in §9. Reference structure:
-  `08-async-copy/kernels.cuh::gemm_v1_async`. Expected ~1.3-1.5× over 10.2.
+- **10.3 with STAGES=3 or 4.** The current 10.3 uses STAGES=2 (shared-memory
+  budget). With `cudaFuncSetAttribute(.., cudaFuncAttributeMaxDynamicSharedMemorySize, ..)`
+  to opt into the 100 KB-per-block limit on sm_89, STAGES=3 fits and may hide
+  more of the K/V load latency. See M08 §3a for the deeper-pipeline pattern.
 - **Port the four shape variants to WMMA.** Take `flash_attention_wmma` and
   add the MHA / causal / KV-cache / GQA overlays from §10. Causal at WMMA
   granularity is the most interesting because the per-tile mask now applies
@@ -467,6 +505,11 @@ What to look at, by rung:
   diluting the average). DRAM throughput should be *lower* than 10.1 because
   inputs are FP16 (half the bytes per element). Watch
   "Smem→Reg" traffic — that's the O-scaling round-trip in step 4 of §8.
+- **10.3 vs 10.2**: Tensor Core utilization should be a few points higher
+  (memory now overlaps compute, so the SM is less idle waiting on K/V).
+  Look at the `Memory Workload Analysis` view — the "Stall (Long Scoreboard)"
+  metric, which is the "I'm waiting for a DRAM load" stall, should drop
+  visibly. DRAM bandwidth utilization in the bench measured run goes up.
 - **causal**: at large N, "thread instructions executed" should be ~half of
   the non-causal kernel. If it isn't, the tile-skip isn't kicking in.
 

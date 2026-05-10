@@ -50,7 +50,7 @@ static void run_for_size(int N) {
     report("10.0 flash (one-thread/row)", bench(flash));
     report("10.1 flash warp-cooperative", bench(flash_warp));
 
-    // M10.2 WMMA: FP16 inputs. Uses a separate set of buffers.
+    // M10.2 / 10.3 WMMA: FP16 inputs. Uses a separate set of buffers.
     {
         __half *d_Qh, *d_Kh, *d_Vh;
         CUDA_CHECK(cudaMalloc(&d_Qh, N * D * sizeof(__half)));
@@ -59,8 +59,10 @@ static void run_for_size(int N) {
         CUDA_CHECK(cudaMemset(d_Qh, 0, N * D * sizeof(__half)));
         CUDA_CHECK(cudaMemset(d_Kh, 0, N * D * sizeof(__half)));
         CUDA_CHECK(cudaMemset(d_Vh, 0, N * D * sizeof(__half)));
-        auto flash_wmma = [&] { launch_flash_wmma(d_Qh, d_Kh, d_Vh, d_O, N); };
-        report("10.2 flash WMMA (fp16 in)", bench(flash_wmma));
+        auto flash_wmma       = [&] { launch_flash_wmma      (d_Qh, d_Kh, d_Vh, d_O, N); };
+        auto flash_async_wmma = [&] { launch_flash_async_wmma(d_Qh, d_Kh, d_Vh, d_O, N); };
+        report("10.2 flash WMMA (fp16 in)",        bench(flash_wmma));
+        report("10.3 flash cp.async + WMMA",       bench(flash_async_wmma));
         CUDA_CHECK(cudaFree(d_Qh));
         CUDA_CHECK(cudaFree(d_Kh));
         CUDA_CHECK(cudaFree(d_Vh));

@@ -194,22 +194,26 @@ Online softmax at 1008 GB/s = peak DRAM. Fused softmax beats unfused by 2.2×. G
 
 ## M10 — FlashAttention optimization ladder (D=64, single-head)
 
-| N | naive (TFLOPs) | 10.0 one-thread/row (TFLOPs) | 10.1 warp-coop FP32 (TFLOPs) | 10.2 WMMA FP16 (TFLOPs) |
-|---|---|---|---|---|
-| 2048 | 1.88 | 1.62 | 2.15 | 5.17 |
-| 4096 | 1.88 | 3.26 | 4.36 | 10.44 |
-| 8192 | 1.81 | 6.47 | 8.78 | **21.10** |
+| N | naive (TFLOPs) | 10.0 one-thread/row | 10.1 warp-coop FP32 | 10.2 WMMA FP16 | **10.3 cp.async + WMMA** |
+|---|---|---|---|---|---|
+| 2048 | 1.88 | 1.61 | 2.13 | 5.17 | **6.39** |
+| 4096 | 1.88 | 3.24 | 4.32 | 10.43 | **13.03** |
+| 8192 | 1.81 | 6.84 | 9.26 | 22.47 | **28.01** |
 
-10.0 → 10.2 = **3.3× speedup at N=8192**. WMMA tensor cores get the dot-product parallelism for free; FP32 (10.0/10.1) leaves it on the table because the FMA pipe is already saturated by the simple form.
+10.0 → 10.3 = **4.1× speedup at N=8192**. The full ladder progression:
+- WMMA tensor cores get the dot-product parallelism for free (3.3× over FP32).
+- `cp.async` double-buffering on top of WMMA hides one tile's load latency (~1.25-1.32× over 10.2).
 
-Verify (vs naive reference):
-- M10.0: max_abs=1.60e-7 (FP32 epsilon; was already in the course)
+Verify (vs naive reference at small sizes):
+- M10.0: max_abs=1.60e-7 (FP32 epsilon)
 - M10.1: max_abs=1.27e-7 at N=2048 (FP32 epsilon)
-- M10.2: max_abs=1.26e-5 at N=2048 (FP16 inputs, comfortable PASS at rel=2e-2 tolerance — 400× margin)
+- M10.2: max_abs=1.26e-5 at N=2048 (FP16 inputs; 400× margin under rel=2e-2 tolerance)
+- M10.3: max_abs=1.26e-5 at N=2048 (**bit-for-bit identical to M10.2** — cp.async is a pure perf optimization, no numerical change)
 
-**Honest engineering note from A10:** the original spec called M10.1 "warp-cooperative dot product" (lanes parallelize over D, butterfly reduction). That underperformed the simpler "bigger blocks for better K-tile amortization" approach at FP32 — shuffles cost more than FMAs save when the FMA pipe is already full. Final M10.1 is the latter; the README §7 turns this into the pedagogical lesson that "warp cooperation is a tensor-core trick, not an FP32 trick."
+**Honest engineering notes:**
 
-**M10.2 is at 22 TF/s, not 50 TF/s.** The remaining gap is the per-iteration O-scaling shared-memory round-trip (WMMA accumulator layout is opaque, so we can't scale O in registers). Closing this requires either raw `mma.sync` (M13 has a single-warp example; production-quality is harder) or `cp.async` overlap (M10.3 stretch spec). Both are documented; the user has a clean runway from 22 TF/s to ~50+ TF/s.
+- M10.1 ("warp-cooperative dot product"): A10 tried the spec (lanes parallelize over D, butterfly reduction) and found it *underperformed* the simpler "bigger blocks for better K-tile amortization" at FP32 — shuffles cost more than FMAs save when the FMA pipe is already full. The pedagogical lesson in §7: "warp cooperation is a tensor-core trick, not an FP32 trick."
+- M10.3 at 28 TF/s (target was 28-30): with STAGES=2 we hide *one* tile's load latency; the remaining gap to cuBLAS hgemm (159 TF/s) is the per-iter softmax-on-fragments dance (store S → row reduce → write FP16 P → load P frag) and the O-rescale shared-memory round-trip — both are register-layout-opaque WMMA artefacts and won't move without raw `mma.sync`. STAGES=3/4 would need `cudaFuncSetAttribute` opt-in to the sm_89 100 KB shared-mem limit; left as documented future stretch.
 
 ## M11 — Low-latency
 

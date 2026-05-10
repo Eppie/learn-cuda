@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>      // M10.3: __pipeline_memcpy_async / commit / wait_prior
 #include <mma.h>
 #include <cmath>
 
@@ -964,6 +965,318 @@ inline void launch_flash_wmma(const __half* Q, const __half* K, const __half* V,
     dim3 block(M10_2_THREADS);                  // 128 threads = 4 warps
     dim3 grid((N + BR2_BLOCK - 1) / BR2_BLOCK);
     flash_attention_wmma<<<grid, block>>>(Q, K, V, O, N);
+}
+
+// ============================================================================
+// M10.3 — cp.async + WMMA FlashAttention (stretch in README §9).
+//
+// Same algorithm as M10.2; the only change is that the K/V tile loads are
+// double-buffered with cp.async so that the next tile's DRAM->SMEM transfer
+// is in flight while the current tile is being consumed by the WMMA dance.
+//
+// Reference structure: M08 `gemm_v1_async` (legacy `__pipeline_memcpy_async`
+// API, STAGES-deep). We pick STAGES = 2 here: the extra SMEM cost is small
+// (8 KB on top of M10.2's ~38 KB) and it fits in the default 48 KB without
+// `cudaFuncSetAttribute`. STAGES >= 3 is left as further stretch.
+//
+// Pipeline shape (per block):
+//
+//   issue_loads(K[0], V[0] -> Ks[0], Vs[0])
+//   __pipeline_commit();
+//
+//   for j in [0, Tc):
+//       if j + 1 < Tc:
+//           issue_loads(K[j+1], V[j+1] -> Ks[(j+1)%2], Vs[(j+1)%2])
+//       __pipeline_commit();
+//       __pipeline_wait_prior(STAGES - 1);   // oldest commit done
+//       __syncthreads();
+//
+//       // ... M10.2 inner body on Ks[j%2], Vs[j%2] ...
+//
+//       __syncthreads();   // WAR fence: next iter's cp.async writes a buffer
+//                          // that aliases this iter's compute reads under
+//                          // STAGES=2 (see M08 §3a).
+//
+// Out-of-bounds K/V rows in the final tile: cp.async loads from a *clamped*
+// source row (min(kcol, N-1)), giving finite garbage values. M10.2's existing
+// post-softmax mask sets the corresponding S columns to -INF, so the
+// resulting P entries are 0 and the garbage Vs values get multiplied out.
+// (The garbage values must be finite, not NaN/inf, because 0 * NaN = NaN.)
+// ============================================================================
+
+constexpr int STAGES_M10_3 = 2;
+constexpr int M10_3_THREADS = M10_2_THREADS;       // reuse 128 (4 warps)
+
+// 16-byte cp.async = 8 halves per transfer. With BC2 * D2 = 32 * 64 = 2048
+// halves per tile and 128 threads, that's 2 transfers per thread.
+constexpr int M10_3_VEC_HALVES = 8;
+
+__device__ __forceinline__ void m10_3_cp_async_16(void* smem_dst, const void* gmem_src) {
+    // 16-byte cp.async. Identical to what `__pipeline_memcpy_async(.., 16)`
+    // emits: `cp.async.cg.shared.global ..., 16, 16` (skip L1, cache at L2).
+    __pipeline_memcpy_async(smem_dst, gmem_src, sizeof(int4));
+}
+
+__global__ void flash_attention_async_wmma(const __half* __restrict__ Q,
+                                           const __half* __restrict__ K,
+                                           const __half* __restrict__ V,
+                                           float*        __restrict__ O,
+                                           int N) {
+    int warp_id = threadIdx.x >> 5;
+    int lane    = threadIdx.x & 31;
+
+    int row_base = blockIdx.x * BR2_BLOCK + warp_id * BR2;
+
+    // Double-buffered K/V tiles.
+    __shared__ __half Ks[STAGES_M10_3][BC2 * D2];
+    __shared__ __half Vs[STAGES_M10_3][BC2 * D2];
+
+    // M10.2's per-warp scratch (unchanged).
+    __shared__ float  Ssm_blk     [WARPS_M10_2 * BR2 * BC2];
+    __shared__ __half Psm_blk     [WARPS_M10_2 * BR2 * BC2];
+    __shared__ float  Osm_blk     [WARPS_M10_2 * BR2 * D2];
+    __shared__ float  m_state_blk [WARPS_M10_2 * BR2];
+    __shared__ float  l_state_blk [WARPS_M10_2 * BR2];
+    __shared__ float  alpha_blk   [WARPS_M10_2 * BR2];
+
+    float*  Ssm        = &Ssm_blk    [warp_id * BR2 * BC2];
+    __half* Psm        = &Psm_blk    [warp_id * BR2 * BC2];
+    float*  Osm        = &Osm_blk    [warp_id * BR2 * D2];
+    float*  m_state_sm = &m_state_blk[warp_id * BR2];
+    float*  l_state_sm = &l_state_blk[warp_id * BR2];
+    float*  alpha_sm   = &alpha_blk  [warp_id * BR2];
+    __half* Qstage     = reinterpret_cast<__half*>(Osm);   // reuse Osm bytes
+
+    if (lane < BR2) {
+        m_state_sm[lane] = -INFINITY;
+        l_state_sm[lane] = 0.0f;
+    }
+
+    // ---- Stage Q for this warp into Qstage, then load 4 frags ----
+    for (int idx = lane; idx < BR2 * D2; idx += 32) {
+        int r = idx / D2;
+        int d = idx % D2;
+        int row = row_base + r;
+        Qstage[r * D2 + d] = (row < N) ? Q[row * D2 + d] : __float2half(0.0f);
+    }
+    __syncwarp();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> q_frag[FRAGS_D2];
+    #pragma unroll
+    for (int kk = 0; kk < FRAGS_D2; ++kk) {
+        wmma::load_matrix_sync(q_frag[kk], &Qstage[kk * 16], D2);
+    }
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_frag[FRAGS_D2];
+    #pragma unroll
+    for (int kk = 0; kk < FRAGS_D2; ++kk) wmma::fill_fragment(o_frag[kk], 0.0f);
+
+    const float scale = 1.0f / sqrtf((float)D2);
+    int Tc = (N + BC2 - 1) / BC2;
+
+    // ------------------------------------------------------------------
+    // cp.async issue helper.
+    //
+    // Each tile is BC2*D2 = 2048 halves = 4096 B. With 128 threads * 16 B
+    // (= 8 halves) per transfer we cover 128 * 16 = 2048 B per pass; so we
+    // need 2 passes per tile (= 2 transfers per thread for K, 2 for V).
+    //
+    // For OOB rows in the final tile we clamp the source row to N-1 (still
+    // a valid global address); the post-softmax -INF mask zeroes the
+    // resulting P column so the garbage value never reaches the output.
+    // ------------------------------------------------------------------
+    auto issue_tile = [&](int stage, int j, bool may_be_oob) {
+        // 2048 halves / (128 threads * 8 halves) = 2 passes per K (and 2 per V).
+        // We unroll the per-thread pass count explicitly so the compiler can
+        // schedule the cp.async instructions tightly.
+        constexpr int N_TRANSFERS_PER_TILE = (BC2 * D2) / M10_3_VEC_HALVES;  // 256
+        constexpr int VECS_PER_ROW         = D2 / M10_3_VEC_HALVES;          // 8
+        constexpr int PASSES               = N_TRANSFERS_PER_TILE / M10_3_THREADS;  // 2
+
+        #pragma unroll
+        for (int p = 0; p < PASSES; ++p) {
+            int t = p * M10_3_THREADS + threadIdx.x;
+            int row_in_tile = t / VECS_PER_ROW;       // 0..BC2-1
+            int col_in_row  = (t % VECS_PER_ROW) * M10_3_VEC_HALVES;
+            int kcol = j * BC2 + row_in_tile;
+            int src_row = may_be_oob ? ((kcol < N) ? kcol : (N - 1)) : kcol;
+
+            __half*       k_smem = &Ks[stage][row_in_tile * D2 + col_in_row];
+            __half*       v_smem = &Vs[stage][row_in_tile * D2 + col_in_row];
+            const __half* k_gmem = &K[src_row * D2 + col_in_row];
+            const __half* v_gmem = &V[src_row * D2 + col_in_row];
+
+            m10_3_cp_async_16(k_smem, k_gmem);
+            m10_3_cp_async_16(v_smem, v_gmem);
+        }
+    };
+
+    // ---- Prologue: kick off tile 0 ----
+    if (Tc > 0) issue_tile(0, 0, /*may_be_oob=*/(Tc == 1));
+    __pipeline_commit();
+
+    int compute_stage = 0;
+    int load_stage    = 1 % STAGES_M10_3;
+
+    for (int j = 0; j < Tc; ++j) {
+        // Kick off the NEXT tile (if any) into load_stage.
+        if (j + 1 < Tc) {
+            issue_tile(load_stage, j + 1, /*may_be_oob=*/(j + 2 == Tc));
+        }
+        __pipeline_commit();
+
+        // Wait for the tile we're about to consume.
+        __pipeline_wait_prior(STAGES_M10_3 - 1);
+        __syncthreads();
+
+        // ---- Identical M10.2 inner body on Ks[compute_stage], Vs[compute_stage] ----
+        __half* Ks_cur = Ks[compute_stage];
+        __half* Vs_cur = Vs[compute_stage];
+
+        // S = Q · Kᵀ
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag[FRAGS_BC2];
+        #pragma unroll
+        for (int n = 0; n < FRAGS_BC2; ++n) wmma::fill_fragment(s_frag[n], 0.0f);
+
+        #pragma unroll
+        for (int kk = 0; kk < FRAGS_D2; ++kk) {
+            #pragma unroll
+            for (int n = 0; n < FRAGS_BC2; ++n) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> k_frag;
+                wmma::load_matrix_sync(k_frag, &Ks_cur[(n * 16) * D2 + kk * 16], D2);
+                wmma::mma_sync(s_frag[n], q_frag[kk], k_frag, s_frag[n]);
+            }
+        }
+
+        #pragma unroll
+        for (int n = 0; n < FRAGS_BC2; ++n) {
+            #pragma unroll
+            for (int i = 0; i < s_frag[n].num_elements; ++i) s_frag[n].x[i] *= scale;
+        }
+
+        #pragma unroll
+        for (int n = 0; n < FRAGS_BC2; ++n) {
+            wmma::store_matrix_sync(&Ssm[n * 16], s_frag[n], BC2, wmma::mem_row_major);
+        }
+        __syncwarp();
+
+        if (j == Tc - 1) {
+            for (int idx = lane; idx < BR2 * BC2; idx += 32) {
+                int c = idx % BC2;
+                int kcol = j * BC2 + c;
+                if (kcol >= N) Ssm[idx] = -INFINITY;
+            }
+            __syncwarp();
+        }
+
+        if (lane < BR2) {
+            int r = lane;
+            float* row_S = &Ssm[r * BC2];
+
+            float m_ij = -INFINITY;
+            #pragma unroll
+            for (int c = 0; c < BC2; ++c) m_ij = fmaxf(m_ij, row_S[c]);
+
+            float m_state = m_state_sm[r];
+            float m_new   = fmaxf(m_state, m_ij);
+            float alpha   = (m_state == -INFINITY) ? 0.0f : __expf(m_state - m_new);
+
+            float l_ij = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < BC2; ++c) {
+                float p = __expf(row_S[c] - m_new);
+                Psm[r * BC2 + c] = __float2half(p);
+                l_ij += p;
+            }
+
+            l_state_sm[r] = alpha * l_state_sm[r] + l_ij;
+            m_state_sm[r] = m_new;
+            alpha_sm[r]   = alpha;
+        }
+        __syncwarp();
+
+        // Scale o_frag by α[row] via the shared-memory round trip.
+        // On iter 0, o_frag is identically zero (filled above) and alpha is 0
+        // by construction (m_state == -INFINITY); the scaling is a no-op.
+        // Skipping it saves the store + scale + load round trip on the first
+        // iteration of every block — a small but free win.
+        if (j > 0) {
+            #pragma unroll
+            for (int kk = 0; kk < FRAGS_D2; ++kk) {
+                wmma::store_matrix_sync(&Osm[kk * 16], o_frag[kk], D2, wmma::mem_row_major);
+            }
+            __syncwarp();
+
+            for (int idx = lane; idx < BR2 * D2; idx += 32) {
+                int r = idx / D2;
+                Osm[idx] *= alpha_sm[r];
+            }
+            __syncwarp();
+
+            #pragma unroll
+            for (int kk = 0; kk < FRAGS_D2; ++kk) {
+                wmma::load_matrix_sync(o_frag[kk], &Osm[kk * 16], D2, wmma::mem_row_major);
+            }
+        }
+
+        // O += P · V
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> p_frag[FRAGS_BC2];
+        #pragma unroll
+        for (int n = 0; n < FRAGS_BC2; ++n) {
+            wmma::load_matrix_sync(p_frag[n], &Psm[n * 16], BC2);
+        }
+
+        #pragma unroll
+        for (int kk = 0; kk < FRAGS_D2; ++kk) {
+            #pragma unroll
+            for (int n = 0; n < FRAGS_BC2; ++n) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> v_frag;
+                wmma::load_matrix_sync(v_frag, &Vs_cur[(n * 16) * D2 + kk * 16], D2);
+                wmma::mma_sync(o_frag[kk], p_frag[n], v_frag, o_frag[kk]);
+            }
+        }
+
+        // WAR fence: next iter's cp.async into load_stage may alias this
+        // iter's compute_stage buffer (STAGES=2). Block-wide barrier so all
+        // warps finished reading Ks_cur / Vs_cur before any cp.async store
+        // can overwrite them.
+        __syncthreads();
+
+        compute_stage = (compute_stage + 1) % STAGES_M10_3;
+        load_stage    = (load_stage    + 1) % STAGES_M10_3;
+    }
+
+    // Final O normalization (identical to M10.2).
+    #pragma unroll
+    for (int kk = 0; kk < FRAGS_D2; ++kk) {
+        wmma::store_matrix_sync(&Osm[kk * 16], o_frag[kk], D2, wmma::mem_row_major);
+    }
+    __syncwarp();
+
+    for (int idx = lane; idx < BR2 * D2; idx += 32) {
+        int r = idx / D2;
+        int d = idx % D2;
+        int row = row_base + r;
+        if (row < N) {
+            float inv_l = (l_state_sm[r] > 0.0f) ? (1.0f / l_state_sm[r]) : 0.0f;
+            O[row * D2 + d] = Osm[idx] * inv_l;
+        }
+    }
+}
+
+inline void launch_flash_async_wmma(const __half* Q, const __half* K, const __half* V,
+                                    float* O, int N) {
+    // Sanity: shared memory footprint is well under the 48 KB default.
+    //   Ks: 2 * 32 * 64 * 2 B  = 8192 B
+    //   Vs: 2 * 32 * 64 * 2 B  = 8192 B
+    //   Ssm_blk:  4 * 16 * 32 * 4 B = 8192 B
+    //   Psm_blk:  4 * 16 * 32 * 2 B = 4096 B
+    //   Osm_blk:  4 * 16 * 64 * 4 B = 16384 B
+    //   state arrays: 4 * 16 * 4 * 3 B = 768 B
+    //   total ~ 45.6 KB    (no cudaFuncSetAttribute needed)
+    dim3 block(M10_3_THREADS);
+    dim3 grid((N + BR2_BLOCK - 1) / BR2_BLOCK);
+    flash_attention_async_wmma<<<grid, block>>>(Q, K, V, O, N);
 }
 
 // ============================================================================
