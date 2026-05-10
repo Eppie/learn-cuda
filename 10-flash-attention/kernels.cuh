@@ -5,6 +5,8 @@
 #include <mma.h>
 #include <cmath>
 
+#include "online_softmax.cuh"   // ms_pair, online_softmax_combine_with_factors
+
 constexpr int BR = 32;     // rows of Q per block (also threads per block) — M10.0
 constexpr int BC = 32;     // rows of K/V per inner tile                    — M10.0
 constexpr int D  = 64;     // head dim (compile-time)
@@ -69,24 +71,28 @@ __global__ void flash_attention(const float* __restrict__ Q,
                 if (s[c] > m_ij) m_ij = s[c];
             }
 
-            float m_new = fmaxf(m_state, m_ij);
-            float alpha = expf(m_state - m_new);
-
+            // Tile-local softmax pieces: P_unscaled[c] = exp(s[c] - m_ij),
+            // l_ij = sum P_unscaled.  The full FA combine then folds these into
+            // the running (m_state, l_state) and emits α (apply to old O) and β
+            // (apply to the new tile's P · V contribution).
             float l_ij = 0.0f;
             float p[BC];
             for (int c = 0; c < BC; ++c) {
-                p[c] = expf(s[c] - m_new);
+                p[c] = expf(s[c] - m_ij);
                 l_ij += p[c];
             }
+
+            os_combine_factors r = online_softmax_combine_with_factors(
+                {m_state, l_state}, {m_ij, l_ij});
 
             for (int d = 0; d < D; ++d) {
                 float pv = 0.0f;
                 for (int c = 0; c < BC; ++c) pv += p[c] * Vs[c][d];
-                o[d] = alpha * o[d] + pv;
+                o[d] = r.alpha * o[d] + r.beta * pv;
             }
 
-            l_state = alpha * l_state + l_ij;
-            m_state = m_new;
+            m_state = r.p.m;
+            l_state = r.p.s;
         }
 
         __syncthreads();
@@ -170,24 +176,24 @@ __global__ void flash_attention_mha(const float* __restrict__ Q,
                 if (s[c] > m_ij) m_ij = s[c];
             }
 
-            float m_new = fmaxf(m_state, m_ij);
-            float alpha = expf(m_state - m_new);
-
             float l_ij = 0.0f;
             float p[BC];
             for (int c = 0; c < BC; ++c) {
-                p[c] = expf(s[c] - m_new);
+                p[c] = expf(s[c] - m_ij);
                 l_ij += p[c];
             }
+
+            os_combine_factors r = online_softmax_combine_with_factors(
+                {m_state, l_state}, {m_ij, l_ij});
 
             for (int d = 0; d < D; ++d) {
                 float pv = 0.0f;
                 for (int c = 0; c < BC; ++c) pv += p[c] * Vs[c][d];
-                o[d] = alpha * o[d] + pv;
+                o[d] = r.alpha * o[d] + r.beta * pv;
             }
 
-            l_state = alpha * l_state + l_ij;
-            m_state = m_new;
+            m_state = r.p.m;
+            l_state = r.p.s;
         }
 
         __syncthreads();
@@ -294,24 +300,24 @@ __global__ void flash_attention_causal(const float* __restrict__ Q,
                     if (s[c] > m_ij) m_ij = s[c];
                 }
 
-                float m_new = fmaxf(m_state, m_ij);
-                float alpha = expf(m_state - m_new);
-
                 float l_ij = 0.0f;
                 float p[BC];
                 for (int c = 0; c < BC; ++c) {
-                    p[c] = expf(s[c] - m_new);
+                    p[c] = expf(s[c] - m_ij);
                     l_ij += p[c];
                 }
+
+                os_combine_factors r = online_softmax_combine_with_factors(
+                    {m_state, l_state}, {m_ij, l_ij});
 
                 for (int d = 0; d < D; ++d) {
                     float pv = 0.0f;
                     for (int c = 0; c < BC; ++c) pv += p[c] * Vs[c][d];
-                    o[d] = alpha * o[d] + pv;
+                    o[d] = r.alpha * o[d] + r.beta * pv;
                 }
 
-                l_state = alpha * l_state + l_ij;
-                m_state = m_new;
+                m_state = r.p.m;
+                l_state = r.p.s;
             }
         }
 
@@ -418,26 +424,26 @@ __global__ void flash_attention_kvcache(const float* __restrict__ Q,
             if (s[c] > m_ij) m_ij = s[c];
         }
 
-        float m_new = fmaxf(m_state, m_ij);
-        float alpha = expf(m_state - m_new);
-
         float l_ij = 0.0f;
         float p[BC];
         for (int c = 0; c < BC; ++c) {
-            p[c] = expf(s[c] - m_new);
+            p[c] = expf(s[c] - m_ij);
             l_ij += p[c];
         }
+
+        os_combine_factors r = online_softmax_combine_with_factors(
+            {m_state, l_state}, {m_ij, l_ij});
 
         // Each thread accumulates its DT output dims.
         for (int i = 0; i < DT; ++i) {
             int d = tid * DT + i;
             float pv = 0.0f;
             for (int c = 0; c < BC; ++c) pv += p[c] * Vs[c][d];
-            o_t[i] = alpha * o_t[i] + pv;
+            o_t[i] = r.alpha * o_t[i] + r.beta * pv;
         }
 
-        l_state = alpha * l_state + l_ij;
-        m_state = m_new;
+        m_state = r.p.m;
+        l_state = r.p.s;
 
         __syncthreads();
     }
@@ -534,24 +540,24 @@ __global__ void flash_attention_gqa(const float* __restrict__ Q,
                 if (s[c] > m_ij) m_ij = s[c];
             }
 
-            float m_new = fmaxf(m_state, m_ij);
-            float alpha = expf(m_state - m_new);
-
             float l_ij = 0.0f;
             float p[BC];
             for (int c = 0; c < BC; ++c) {
-                p[c] = expf(s[c] - m_new);
+                p[c] = expf(s[c] - m_ij);
                 l_ij += p[c];
             }
+
+            os_combine_factors r = online_softmax_combine_with_factors(
+                {m_state, l_state}, {m_ij, l_ij});
 
             for (int d = 0; d < D; ++d) {
                 float pv = 0.0f;
                 for (int c = 0; c < BC; ++c) pv += p[c] * Vs[c][d];
-                o[d] = alpha * o[d] + pv;
+                o[d] = r.alpha * o[d] + r.beta * pv;
             }
 
-            l_state = alpha * l_state + l_ij;
-            m_state = m_new;
+            m_state = r.p.m;
+            l_state = r.p.s;
         }
 
         __syncthreads();
@@ -655,27 +661,27 @@ __global__ void flash_attention_warp(const float* __restrict__ Q,
                 if (s[c] > m_ij) m_ij = s[c];
             }
 
-            float m_new = fmaxf(m_state, m_ij);
-            float alpha = (m_state == -INFINITY) ? 0.0f : __expf(m_state - m_new);
-
             float l_ij = 0.0f;
             float p[BC1];
             #pragma unroll
             for (int c = 0; c < BC1; ++c) {
-                p[c] = __expf(s[c] - m_new);
+                p[c] = __expf(s[c] - m_ij);
                 l_ij += p[c];
             }
+
+            os_combine_factors r = online_softmax_combine_with_factors(
+                {m_state, l_state}, {m_ij, l_ij});
 
             #pragma unroll
             for (int d = 0; d < D1; ++d) {
                 float pv = 0.0f;
                 #pragma unroll
                 for (int c = 0; c < BC1; ++c) pv += p[c] * Vs[c][d];
-                o[d] = alpha * o[d] + pv;
+                o[d] = r.alpha * o[d] + r.beta * pv;
             }
 
-            l_state = alpha * l_state + l_ij;
-            m_state = m_new;
+            m_state = r.p.m;
+            l_state = r.p.s;
         }
 
         __syncthreads();
