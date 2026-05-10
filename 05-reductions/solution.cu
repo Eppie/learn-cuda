@@ -8,8 +8,10 @@
 //
 // Plus building blocks reused by Modules 9 and 10:
 //   row_sum_kernel        — per-row sum of an MxN matrix
-//   online_softmax_warp   — single-pass (max, sum) recurrence at warp scope
-//   online_softmax_block  — same recurrence at block scope
+//   online_softmax_*      — single-pass (max, sum) recurrence at warp/block scope
+//                           (lifted to common/online_softmax.cuh so M9 and M10
+//                            can share the same primitives — see the header for
+//                            full documentation)
 //
 // Each kernel writes one partial sum per block; the host adds them up.
 
@@ -19,6 +21,7 @@
 #include <vector>
 
 #include "cuda_utils.h"
+#include "online_softmax.cuh"
 
 constexpr int BLK     = 256;
 constexpr int N_WARPS = BLK / 32;
@@ -52,75 +55,10 @@ __device__ __forceinline__ float block_reduce_sum(float v) {
     return v;       // valid in lane 0 of warp 0
 }
 
-// ---------------------------------------------------------------------------
-// Online softmax primitive: running (max, sum) recurrence.
-// M09 and M10 USE this; the contract here is intentionally minimal.
-//
-// Combine two streams (m1, s1) and (m2, s2) representing the running max
-// and the running sum-of-exps (relative to that max):
-//     m_new = max(m1, m2)
-//     s_new = s1 * exp(m1 - m_new) + s2 * exp(m2 - m_new)
-// Numerically stable: both arguments to exp are <= 0.
-// ---------------------------------------------------------------------------
-struct ms_pair {
-    float m;   // running max
-    float s;   // running sum of exp(x_i - m) over elements seen so far
-};
-
-__device__ __forceinline__ ms_pair online_softmax_combine(ms_pair a, ms_pair b) {
-    float m = fmaxf(a.m, b.m);
-    // Guard against -INF - -INF = NaN when both inputs are the identity.
-    float ea = (a.m == -INFINITY) ? 0.0f : __expf(a.m - m);
-    float eb = (b.m == -INFINITY) ? 0.0f : __expf(b.m - m);
-    return {m, a.s * ea + b.s * eb};
-}
-
-// Identity for the online-softmax monoid: m = -inf, s = 0.
-__device__ __forceinline__ ms_pair online_softmax_identity() {
-    return {-INFINITY, 0.0f};
-}
-
-// Lift a single value into the monoid: a singleton stream is (x, 1.0).
-__device__ __forceinline__ ms_pair online_softmax_singleton(float x) {
-    return {x, 1.0f};
-}
-
-// Warp-scope reduction over the per-lane value.
-// Returns (max, sum-of-exps) valid in lane 0; broadcast via __shfl_sync if needed.
-__device__ __forceinline__ ms_pair online_softmax_warp(float x) {
-    ms_pair p = online_softmax_singleton(x);
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        ms_pair other;
-        other.m = __shfl_down_sync(0xffffffff, p.m, offset);
-        other.s = __shfl_down_sync(0xffffffff, p.s, offset);
-        p = online_softmax_combine(p, other);
-    }
-    return p;   // valid in lane 0
-}
-
-// Block-scope reduction. Caller provides shared scratch sized [N_WARPS].
-// Returns the result valid in lane 0 of warp 0.
-__device__ __forceinline__ ms_pair online_softmax_block(float x, ms_pair* warp_scratch) {
-    int lane    = threadIdx.x & 31;
-    int warp_id = threadIdx.x >> 5;
-
-    ms_pair p = online_softmax_warp(x);
-    if (lane == 0) warp_scratch[warp_id] = p;
-    __syncthreads();
-
-    if (warp_id == 0) {
-        ms_pair q = (lane < N_WARPS) ? warp_scratch[lane] : online_softmax_identity();
-        // Final warp-level reduction on the per-warp partials.
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            ms_pair other;
-            other.m = __shfl_down_sync(0xffffffff, q.m, offset);
-            other.s = __shfl_down_sync(0xffffffff, q.s, offset);
-            q = online_softmax_combine(q, other);
-        }
-        p = q;
-    }
-    return p;   // valid in lane 0 of warp 0
-}
+// (Online-softmax primitives — `ms_pair`, `online_softmax_combine`,
+// `online_softmax_warp`, `online_softmax_block`, plus the FA-style
+// `online_softmax_combine_with_factors` — now live in
+// common/online_softmax.cuh.  M9 and M10 share the same primitives.)
 
 // ---------------------------------------------------------------------------
 // Sum-reduction kernels.

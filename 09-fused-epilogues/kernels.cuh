@@ -4,6 +4,8 @@
 #include <cuda_fp16.h>
 #include <cmath>
 
+#include "online_softmax.cuh"   // ms_pair, online_softmax_combine, online_softmax_block
+
 constexpr int BLK     = 256;
 constexpr int N_WARPS = BLK / 32;
 
@@ -92,9 +94,9 @@ __global__ void softmax_fused(const float* __restrict__ in,
 // Per-thread running pair (m, l) is combined across the block via the
 // associative merge formula; the output pass writes y[i] in one shot.
 //
-// This is the same recurrence M10 uses for FlashAttention. If A2 lifts the
-// online_softmax primitives into a shared header in M5, this kernel can be
-// rewritten in terms of them; the math is identical.
+// This is the same recurrence M10 uses for FlashAttention.  The (m, l) pair
+// and the merge formula live in `common/online_softmax.cuh` (lifted out of
+// M5/M9/M10 to a single source of truth).
 // ============================================================================
 __global__ void softmax_online(const float* __restrict__ in,
                                float* __restrict__ out,
@@ -105,25 +107,18 @@ __global__ void softmax_online(const float* __restrict__ in,
     const float* x = in + row * cols;
     float* y = out + row * cols;
 
-    __shared__ float smem[N_WARPS];
+    __shared__ ms_pair os_scratch[N_WARPS];
 
-    // Pass 1: walk x once, maintaining running (m, l).
-    float m = -INFINITY;
-    float l = 0.0f;
+    // Pass 1: walk x once, accumulating per-thread (m, s) via the recurrence.
+    ms_pair acc = online_softmax_identity();
     for (int i = threadIdx.x; i < cols; i += BLK) {
-        float v     = x[i];
-        float m_new = fmaxf(m, v);
-        l = l * expf(m - m_new) + expf(v - m_new);
-        m = m_new;
+        acc = online_softmax_combine(acc, online_softmax_singleton(x[i]));
     }
 
-    // Combine across threads. We need both the global row max and the global
-    // sum of exp(x - row_max). Approach: get row_max via a max-reduction, then
-    // each thread rescales its local l by exp(m_local - row_max) and we sum.
-    float row_max = block_reduce_max(m, smem);
-    float l_scaled = l * expf(m - row_max);
-    float row_sum  = block_reduce_sum(l_scaled, smem);
-    float inv = 1.0f / row_sum;
+    // Block-reduce to get the global (row_max, row_sum), broadcast to every thread.
+    ms_pair total = online_softmax_block_broadcast<BLK>(acc, os_scratch);
+    float row_max = total.m;
+    float inv     = 1.0f / total.s;
 
     // Pass 2: write normalized output.
     for (int i = threadIdx.x; i < cols; i += BLK) {
