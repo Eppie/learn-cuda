@@ -280,14 +280,11 @@ a single-session stretch.
 
 ## Module 10 — FlashAttention
 
-### Stretch — FP16 + Tensor Cores in the inner matmul
-Re-implement the inner `Q · K^T` and `P · V` matmuls using WMMA from
-Module 7. This is the architecture of FlashAttention-1 in real production
-code. Block sizes change: `BR` becomes a multiple of 16 (the WMMA tile);
-each warp owns one 16-row block of Q. The online-softmax `(m, l)` state
-moves from per-thread to per-warp (one warp = one row block, one lane
-holds one row's `m`/`l`). This is several hours of work; budget
-accordingly.
+> Note: "FP16 + Tensor Cores in the inner matmul" and "cp.async double-
+> buffering on top of WMMA" used to be stretch exercises here. They've
+> been promoted to the main ladder as **M10.2** (`flash_attention_wmma`)
+> and **M10.3** (`flash_attention_async_wmma`). Read those sections of
+> M10's README first if you're targeting Project A's higher tiers in M12.
 
 ### Stretch — FlashAttention-2 loop swap
 Swap the loop order so the outer loop is over the K/V tile and the inner
