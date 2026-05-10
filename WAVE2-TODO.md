@@ -22,16 +22,18 @@
 - **Online-softmax shared-header lift** to `common/online_softmax.cuh`
   (§E.1) — M5 / M9 / M10's six non-WMMA kernels now share the same primitive
 - **M10 optimization ladder** — 10.0 → 10.1 → 10.2 WMMA → 10.3 cp.async+WMMA
-  (4.1× speedup from 6.84 → 28.01 TF/s at N=8192 single-head)
+  → 10.4 raw `mma.sync` (**9× total speedup**, 6.56 → 59.36 TF/s at N=8192
+  single-head; ~37% of cuBLAS hgemm peak)
 
 **Deferred (post-course / future):**
 - PROJECT-E (Mamba inference megakernel) — spec only; implementation is
   multi-week, post-course.
-- M10.4 (raw mma.sync flash) — in progress as of this writing.
+- M10.4 `ldmatrix.x2.trans` for the V-as-B load — currently uses manual
+  scalar `__half` reads; explicit "next +10-15%" step.
+- M10 STAGES=3/4 cp.async depth — needs `cudaFuncSetAttribute` opt-in to
+  the sm_89 100 KB shared-mem limit.
 - Cosmetic subsection numbering (M07.0/.1/.2, M11.0/.1/...) — skipped as
   low-value relative to risk of breaking cross-references.
-- M10.2's WMMA softmax-on-fragments dance — left inline; eliminating it
-  requires the M10.4 raw-mma.sync path.
 
 ---
 
