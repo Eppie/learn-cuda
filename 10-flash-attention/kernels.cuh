@@ -1731,6 +1731,338 @@ inline void launch_flash_mma(const __half* Q, const __half* K, const __half* V,
 }
 
 // ============================================================================
+// M10.5 — Raw mma.sync + ldmatrix fragment loads (the FA-2 / CUTLASS shape).
+//
+// Identical algorithm and tile shape to M10.4. Only the shared→register
+// fragment load paths change:
+//   - Q (A operand of S = Q · K^T): replaced 4 manual __half2 loads per lane
+//     per k-chunk with one `ldmatrix.sync.aligned.m8n8.x4.shared.b16`.
+//   - V (B operand of O += P · V): replaced 4 scalar __half loads per lane
+//     per (p_chunk, d_chunk) with one `ldmatrix.sync.aligned.m8n8.x2.trans
+//     .shared.b16`. The `.trans` variant transposes each 8×8 tile during the
+//     load, turning V's row-major rows into the col-major-fragment layout
+//     mma.sync wants on the B side.
+//
+// K is left on the manual __half2 path: K^T as B is read with a layout where
+// the manual code is already two __half2 reads per lane (clean and fast), so
+// it's not the slow load. V is the win here.
+//
+// Lane → ldmatrix pointer mapping (32 lanes, x4):
+//   lane L provides one row address. Tile (L/8) holds 8 rows; the lane's row
+//   within that tile is (L%8). For a 16×16 A fragment laid out in shared as
+//   16 rows × 16 fp16 (row-major, 32 B/row), the four 8×8 tiles are:
+//     tile 0 (a0): rows  0..7,  cols 0..7
+//     tile 1 (a1): rows  8..15, cols 0..7
+//     tile 2 (a2): rows  0..7,  cols 8..15
+//     tile 3 (a3): rows  8..15, cols 8..15
+//   After the load, lane (q=L/4, t=L%4) holds in r0..r3 the 2-fp16 pairs
+//   {tile, row q, cols 2t..2t+1} — exactly the mma m16n8k16 A layout.
+//
+// For ldmatrix.x2.trans on V (B fragment for P·V): B is 16 rows × 8 cols
+// (col-major). With .trans, ldmatrix transposes each of the 2 input 8×8
+// tiles read row-major from shared. The 2 tiles correspond to B rows 0..7
+// and rows 8..15. Lane L (0..15) provides &V_tile[(pc*16 + L) * D4 + dc*8]
+// (a 16-byte aligned row pointer); lanes 16..31's addresses are unused
+// (we still pass a valid address for safety). Lane (q, t) ends up with
+// r0 = pair (rows 2t..2t+1, col q), r1 = pair (rows 2t+8..2t+9, col q).
+// ============================================================================
+
+// Issue ldmatrix.x4 on an A-fragment in shared memory laid out as 16 rows ×
+// 16 fp16 starting at `tile_base`. Lane L provides the row pointer for its
+// tile. Outputs r0..r3 follow the mma m16n8k16 A layout described above.
+__device__ __forceinline__ void ldmatrix_x4(uint32_t& r0, uint32_t& r1,
+                                            uint32_t& r2, uint32_t& r3,
+                                            const __half* tile_base,
+                                            int row_stride_halves) {
+    int lane = threadIdx.x & 31;
+    int tile = lane >> 3;          // 0..3 = which 8×8 tile this lane addresses
+    int row  = lane & 7;           // 0..7 = row within that tile
+    // Tile (col_block, row_block): tile 0 = (rows 0-7, cols 0-7), tile 1 = (rows 8-15, cols 0-7),
+    // tile 2 = (rows 0-7, cols 8-15), tile 3 = (rows 8-15, cols 8-15).
+    int row_block = tile & 1;      // 0 or 1 → rows 0-7 or rows 8-15
+    int col_block = tile >> 1;     // 0 or 1 → cols 0-7 or cols 8-15
+    const __half* row_addr = tile_base
+        + (row_block * 8 + row) * row_stride_halves
+        + col_block * 8;
+    uint32_t smem_int = __cvta_generic_to_shared(row_addr);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+        :  "r"(smem_int));
+}
+
+// Issue ldmatrix.x2.trans on a B-fragment in shared memory laid out as 16
+// rows × 8 fp16 starting at `tile_base` (row-major in shared). With .trans,
+// lane (q=L/4, t=L%4) gets r0 = (rows 2t..2t+1, col q), r1 = (rows 2t+8..2t+9,
+// col q) — the mma m16n8k16 B layout.
+__device__ __forceinline__ void ldmatrix_x2_trans(uint32_t& r0, uint32_t& r1,
+                                                  const __half* tile_base,
+                                                  int row_stride_halves) {
+    int lane = threadIdx.x & 31;
+    // For x2: lanes 0..7 provide rows of tile 0 (B rows 0..7), lanes 8..15
+    // provide rows of tile 1 (B rows 8..15). Lanes 16..31 are unused; we
+    // pass them lane 0's address for safety.
+    int eff = lane & 15;           // 0..15
+    const __half* row_addr = tile_base + eff * row_stride_halves;
+    uint32_t smem_int = __cvta_generic_to_shared(row_addr);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
+        : "=r"(r0), "=r"(r1)
+        :  "r"(smem_int));
+}
+
+__global__ void flash_attention_mma_ldmatrix(const __half* __restrict__ Q,
+                                             const __half* __restrict__ K,
+                                             const __half* __restrict__ V,
+                                             float*        __restrict__ O,
+                                             int N) {
+    int warp_id = threadIdx.x >> 5;
+    int lane    = threadIdx.x & 31;
+    int q_lane  = lane >> 2;    // 0..7
+    int t_lane  = lane & 3;     // 0..3
+
+    int row_base = blockIdx.x * BR4_BLOCK + warp_id * BR4;
+
+    int row_top = row_base + q_lane;
+    int row_bot = row_base + q_lane + 8;
+
+    __shared__ __half Ks[STAGES_M10_4][BC4 * D4];
+    __shared__ __half Vs[STAGES_M10_4][BC4 * D4];
+
+    __shared__ __half Qs_blk[WARPS_M10_4][BR4 * D4];
+    __half* Qs = Qs_blk[warp_id];
+
+    // ---- Stage Q for this warp ----
+    for (int idx = lane; idx < BR4 * D4; idx += 32) {
+        int r = idx / D4;
+        int d = idx % D4;
+        int row = row_base + r;
+        Qs[r * D4 + d] = (row < N) ? Q[row * D4 + d] : __float2half(0.0f);
+    }
+    __syncwarp();
+
+    // ---- Pre-load Q A-fragments for all 4 k-chunks via ldmatrix.x4 ----
+    uint32_t q_frag[K_CHUNKS_S][4];
+    #pragma unroll
+    for (int kk = 0; kk < K_CHUNKS_S; ++kk) {
+        // 16×16 A fragment lives at Qs[0..15 rows, kk*16..kk*16+15 cols].
+        ldmatrix_x4(q_frag[kk][0], q_frag[kk][1], q_frag[kk][2], q_frag[kk][3],
+                    &Qs[kk * 16], D4);
+    }
+
+    // ---- O accumulator ----
+    float o_frag[D_CHUNKS_O][4];
+    #pragma unroll
+    for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+        o_frag[dc][0] = 0.0f; o_frag[dc][1] = 0.0f;
+        o_frag[dc][2] = 0.0f; o_frag[dc][3] = 0.0f;
+    }
+
+    float m_state[2] = {-INFINITY, -INFINITY};
+    float l_state[2] = {0.0f, 0.0f};
+
+    const float scale = 1.0f / sqrtf((float)D4);
+    int Tc = (N + BC4 - 1) / BC4;
+
+    auto issue_tile = [&](int stage, int j, bool may_be_oob) {
+        constexpr int VEC_HALVES   = 8;
+        constexpr int VECS_PER_ROW = D4 / VEC_HALVES;
+        constexpr int N_TRANSFERS  = (BC4 * D4) / VEC_HALVES;
+        constexpr int PASSES       = N_TRANSFERS / M10_4_THREADS;
+
+        #pragma unroll
+        for (int p = 0; p < PASSES; ++p) {
+            int t = p * M10_4_THREADS + threadIdx.x;
+            int row_in_tile = t / VECS_PER_ROW;
+            int col_in_row  = (t % VECS_PER_ROW) * VEC_HALVES;
+            int kcol = j * BC4 + row_in_tile;
+            int src_row = may_be_oob ? ((kcol < N) ? kcol : (N - 1)) : kcol;
+
+            __half*       k_smem = &Ks[stage][row_in_tile * D4 + col_in_row];
+            __half*       v_smem = &Vs[stage][row_in_tile * D4 + col_in_row];
+            const __half* k_gmem = &K[src_row * D4 + col_in_row];
+            const __half* v_gmem = &V[src_row * D4 + col_in_row];
+
+            m10_4_cp_async_16(k_smem, k_gmem);
+            m10_4_cp_async_16(v_smem, v_gmem);
+        }
+    };
+
+    if (Tc > 0) issue_tile(0, 0, /*may_be_oob=*/(Tc == 1));
+    __pipeline_commit();
+
+    int compute_stage = 0;
+    int load_stage    = 1 % STAGES_M10_4;
+
+    for (int j = 0; j < Tc; ++j) {
+        if (j + 1 < Tc) {
+            issue_tile(load_stage, j + 1, /*may_be_oob=*/(j + 2 == Tc));
+        }
+        __pipeline_commit();
+
+        __pipeline_wait_prior(STAGES_M10_4 - 1);
+        __syncthreads();
+
+        __half* Ks_cur = Ks[compute_stage];
+        __half* Vs_cur = Vs[compute_stage];
+
+        // ---------------- S = Q · K^T ----------------
+        // K (as B = K^T) load stays on the manual __half2 path — already
+        // a clean two-loads-per-lane pattern (K^T's B layout matches
+        // contiguous 32-bit groups in row-major K).
+        float s_frag[N_CHUNKS_S][4];
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            s_frag[n][0] = 0.0f; s_frag[n][1] = 0.0f;
+            s_frag[n][2] = 0.0f; s_frag[n][3] = 0.0f;
+        }
+
+        #pragma unroll
+        for (int kk = 0; kk < K_CHUNKS_S; ++kk) {
+            #pragma unroll
+            for (int n = 0; n < N_CHUNKS_S; ++n) {
+                int k_row = n * 8 + q_lane;
+                __half2 b0v = *reinterpret_cast<__half2*>(
+                    &Ks_cur[k_row * D4 + kk * 16 + 2 * t_lane]);
+                __half2 b1v = *reinterpret_cast<__half2*>(
+                    &Ks_cur[k_row * D4 + kk * 16 + 2 * t_lane + 8]);
+                uint32_t b0 = pack_half2(b0v);
+                uint32_t b1 = pack_half2(b1v);
+
+                mma_m16n8k16(s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3],
+                             q_frag[kk][0], q_frag[kk][1], q_frag[kk][2], q_frag[kk][3],
+                             b0, b1,
+                             s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3]);
+            }
+        }
+
+        // ---- Scale + OOB mask ----
+        bool last_tile = (j == Tc - 1);
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            int col0 = n * 8 + 2 * t_lane;
+            int col1 = col0 + 1;
+            int kcol0 = j * BC4 + col0;
+            int kcol1 = j * BC4 + col1;
+            bool m0 = last_tile && (kcol0 >= N);
+            bool m1 = last_tile && (kcol1 >= N);
+            s_frag[n][0] = m0 ? -INFINITY : (s_frag[n][0] * scale);
+            s_frag[n][1] = m1 ? -INFINITY : (s_frag[n][1] * scale);
+            s_frag[n][2] = m0 ? -INFINITY : (s_frag[n][2] * scale);
+            s_frag[n][3] = m1 ? -INFINITY : (s_frag[n][3] * scale);
+        }
+
+        // ---- Row max ----
+        float row_max_top = -INFINITY;
+        float row_max_bot = -INFINITY;
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            row_max_top = fmaxf(row_max_top, fmaxf(s_frag[n][0], s_frag[n][1]));
+            row_max_bot = fmaxf(row_max_bot, fmaxf(s_frag[n][2], s_frag[n][3]));
+        }
+        row_max_top = fmaxf(row_max_top, __shfl_xor_sync(0xffffffff, row_max_top, 1));
+        row_max_top = fmaxf(row_max_top, __shfl_xor_sync(0xffffffff, row_max_top, 2));
+        row_max_bot = fmaxf(row_max_bot, __shfl_xor_sync(0xffffffff, row_max_bot, 1));
+        row_max_bot = fmaxf(row_max_bot, __shfl_xor_sync(0xffffffff, row_max_bot, 2));
+
+        float m_new_top = fmaxf(m_state[0], row_max_top);
+        float m_new_bot = fmaxf(m_state[1], row_max_bot);
+        float alpha_top = (m_state[0] == -INFINITY) ? 0.0f : __expf(m_state[0] - m_new_top);
+        float alpha_bot = (m_state[1] == -INFINITY) ? 0.0f : __expf(m_state[1] - m_new_bot);
+
+        #pragma unroll
+        for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+            o_frag[dc][0] *= alpha_top;
+            o_frag[dc][1] *= alpha_top;
+            o_frag[dc][2] *= alpha_bot;
+            o_frag[dc][3] *= alpha_bot;
+        }
+
+        float l_ij_top = 0.0f;
+        float l_ij_bot = 0.0f;
+        float p_vals[N_CHUNKS_S][4];
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            float p0 = (s_frag[n][0] == -INFINITY) ? 0.0f : __expf(s_frag[n][0] - m_new_top);
+            float p1 = (s_frag[n][1] == -INFINITY) ? 0.0f : __expf(s_frag[n][1] - m_new_top);
+            float p2 = (s_frag[n][2] == -INFINITY) ? 0.0f : __expf(s_frag[n][2] - m_new_bot);
+            float p3 = (s_frag[n][3] == -INFINITY) ? 0.0f : __expf(s_frag[n][3] - m_new_bot);
+            p_vals[n][0] = p0; p_vals[n][1] = p1;
+            p_vals[n][2] = p2; p_vals[n][3] = p3;
+            l_ij_top += p0 + p1;
+            l_ij_bot += p2 + p3;
+        }
+        l_ij_top += __shfl_xor_sync(0xffffffff, l_ij_top, 1);
+        l_ij_top += __shfl_xor_sync(0xffffffff, l_ij_top, 2);
+        l_ij_bot += __shfl_xor_sync(0xffffffff, l_ij_bot, 1);
+        l_ij_bot += __shfl_xor_sync(0xffffffff, l_ij_bot, 2);
+
+        l_state[0] = alpha_top * l_state[0] + l_ij_top;
+        l_state[1] = alpha_bot * l_state[1] + l_ij_bot;
+        m_state[0] = m_new_top;
+        m_state[1] = m_new_bot;
+
+        // ---- Repack P into A-fragment layout (same as M10.4) ----
+        uint32_t p_frag[P_CHUNKS][4];
+        #pragma unroll
+        for (int pc = 0; pc < P_CHUNKS; ++pc) {
+            int n0 = 2 * pc;
+            int n1 = 2 * pc + 1;
+            p_frag[pc][0] = pack_halves(__float2half(p_vals[n0][0]), __float2half(p_vals[n0][1]));
+            p_frag[pc][1] = pack_halves(__float2half(p_vals[n0][2]), __float2half(p_vals[n0][3]));
+            p_frag[pc][2] = pack_halves(__float2half(p_vals[n1][0]), __float2half(p_vals[n1][1]));
+            p_frag[pc][3] = pack_halves(__float2half(p_vals[n1][2]), __float2half(p_vals[n1][3]));
+        }
+
+        // ---------------- O += P · V (V load via ldmatrix.x2.trans) ----------------
+        #pragma unroll
+        for (int pc = 0; pc < P_CHUNKS; ++pc) {
+            #pragma unroll
+            for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+                // 16 rows × 8 cols sub-tile of V at (rows pc*16..pc*16+15, cols dc*8..dc*8+7).
+                uint32_t b0, b1;
+                ldmatrix_x2_trans(b0, b1, &Vs_cur[pc * 16 * D4 + dc * 8], D4);
+
+                mma_m16n8k16(o_frag[dc][0], o_frag[dc][1], o_frag[dc][2], o_frag[dc][3],
+                             p_frag[pc][0], p_frag[pc][1], p_frag[pc][2], p_frag[pc][3],
+                             b0, b1,
+                             o_frag[dc][0], o_frag[dc][1], o_frag[dc][2], o_frag[dc][3]);
+            }
+        }
+
+        __syncthreads();
+
+        compute_stage = (compute_stage + 1) % STAGES_M10_4;
+        load_stage    = (load_stage    + 1) % STAGES_M10_4;
+    }
+
+    // ---- Normalize and write O ----
+    float inv_l_top = (l_state[0] > 0.0f) ? (1.0f / l_state[0]) : 0.0f;
+    float inv_l_bot = (l_state[1] > 0.0f) ? (1.0f / l_state[1]) : 0.0f;
+
+    #pragma unroll
+    for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+        int col0 = dc * 8 + 2 * t_lane;
+        int col1 = col0 + 1;
+        if (row_top < N) {
+            O[row_top * D4 + col0] = o_frag[dc][0] * inv_l_top;
+            O[row_top * D4 + col1] = o_frag[dc][1] * inv_l_top;
+        }
+        if (row_bot < N) {
+            O[row_bot * D4 + col0] = o_frag[dc][2] * inv_l_bot;
+            O[row_bot * D4 + col1] = o_frag[dc][3] * inv_l_bot;
+        }
+    }
+}
+
+inline void launch_flash_mma_ldmatrix(const __half* Q, const __half* K, const __half* V,
+                                      float* O, int N) {
+    dim3 block(M10_4_THREADS);
+    dim3 grid((N + BR4_BLOCK - 1) / BR4_BLOCK);
+    flash_attention_mma_ldmatrix<<<grid, block>>>(Q, K, V, O, N);
+}
+
+// ============================================================================
 // Naive reference: three kernels, materialized N×N attention matrix.
 // (Single-head only — used by bench.cu for the headline comparison. Multi-head
 // references for the new variants live in solution.cu as host-side functions.)

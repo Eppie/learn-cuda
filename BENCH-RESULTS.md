@@ -194,18 +194,29 @@ Online softmax at 1008 GB/s = peak DRAM. Fused softmax beats unfused by 2.2×. G
 
 ## M10 — FlashAttention optimization ladder (D=64, single-head)
 
-| N | naive | 10.0 thread/row | 10.1 warp-coop FP32 | 10.2 WMMA FP16 | 10.3 cp.async+WMMA | **10.4 raw mma.sync** |
-|---|---|---|---|---|---|---|
-| 2048 | 1.88 | 1.61 | 2.13 | 5.17 | 6.39 | **13.96** |
-| 4096 | 1.90 | 3.24 | 4.32 | 10.44 | 13.03 | **28.54** |
-| 8192 | 1.77 | 6.56 | 8.90 | 21.61 | 26.46 | **59.36** |
+| N | naive | 10.0 thread/row | 10.1 warp-coop | 10.2 WMMA | 10.3 cp.async+WMMA | 10.4 raw mma.sync | 10.5 mma+ldmatrix |
+|---|---|---|---|---|---|---|---|
+| 2048 | 1.88 | 1.61 | 2.13 | 5.17 | 6.39 | 13.83 | 13.68 |
+| 4096 | 1.90 | 3.24 | 4.32 | 10.44 | 13.03 | 28.58 | 28.34 |
+| 8192 | 1.77 | 6.43 | 8.70 | 21.11 | 26.31 | **58.05** | **57.49** |
 
 (TFLOPs/s, min-of-N on RTX 4090, idle GPU. Run-to-run noise at the top of
-the ladder is ~3% — N=8192 10.4 sits in the 58-62 TF/s band depending on
-host scheduler state.)
+the ladder is ~3% — N=8192 10.4/10.5 sit in the 58-62 TF/s band depending
+on host scheduler state.)
+
+**10.5 is essentially tied with 10.4 — and that's the pedagogical point.**
+Replacing 4 scalar `__half` loads per lane per mma with one `ldmatrix.x2.trans`
+instruction saves on SASS instruction count (LDSM vs LDS) but the underlying
+shared-memory access pattern still has the same bank-conflict shape. The
+hardware's transpose wires save instruction issue cost, not bank-system
+throughput. The headline FA-2 / CUTLASS win from `ldmatrix` only materializes
+when paired with a **swizzled K/V smem layout** (XOR-permute column indices
+on the cp.async write so the ldmatrix read avoids bank conflicts). That's
+the next rung (M10.6, currently a documented stretch).
 
 **10.0 → 10.4 = 9× speedup at N=8192.** Reaching **~37% of cuBLAS hgemm peak**
-(159 TF/s) in pedagogical code is a strong result. The remaining gap is
+(159 TF/s) in pedagogical code is a strong result. **10.5 = same throughput
+but different SASS** — see the bank-throughput discussion above. The remaining gap is
 CUTLASS-quality scheduling, more aggressive `ldmatrix` usage (A12 used manual
 `__half2` packing for clarity; `ldmatrix.x2.trans` for the V-as-B load would
 recover ~10-15%), and deeper pipelining (STAGES=3/4 needs

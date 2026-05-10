@@ -34,14 +34,15 @@ Modules with extra structure:
   Welford LayerNorm, LN+residual, FP16 LN, GEMM+bias+GELU (post-pass and
   fused).
 - **`10-flash-attention`** — `kernels.cuh` covers two ladders side by side.
-  *Optimization ladder* (5 rungs, 9× total speedup):
+  *Optimization ladder* (6 rungs, 9× total speedup):
   `flash_attention` (10.0, one thread per Q row, FP32),
   `flash_attention_warp` (10.1, bigger blocks),
   `flash_attention_wmma` (10.2, WMMA inner matmul),
   `flash_attention_async_wmma` (10.3, +cp.async),
-  `flash_attention_mma` (10.4, raw `mma.sync` — eliminates WMMA's opaque-
-  fragment round-trips; ~59 TF/s at N=8192 single-head, ~37% of cuBLAS
-  hgemm peak on RTX 4090).
+  `flash_attention_mma` (10.4, raw `mma.sync` — ~59 TF/s at N=8192 single-head),
+  `flash_attention_mma_ldmatrix` (10.5, +`ldmatrix` — same perf as 10.4 in
+  pedagogical form: ldmatrix saves instruction count but not bank throughput;
+  the CUTLASS win needs swizzled smem layout too, queued as M10.6 stretch).
   *Shape variants on the simple base*: MHA, causal+tile-skip, KV-cache, GQA.
 - **`11-low-latency`** — multiple demo files: `bench.cu`, `events_demo.cu`,
   `persistent_demo.cu`, `ring_buffer.cu`. Module README is structured in

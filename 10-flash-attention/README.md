@@ -161,11 +161,13 @@ three working kernels and a stretch spec:
 | 10.2   | `flash_attention_wmma`          | FP16     | WMMA tensor-cores   | 22 TF/s         |
 | 10.3   | `flash_attention_async_wmma`    | FP16     | WMMA + cp.async ×2  | 28 TF/s         |
 | 10.4   | `flash_attention_mma`           | FP16     | raw `mma.sync` + cp.async | 62 TF/s   |
+| 10.5   | `flash_attention_mma_ldmatrix`  | FP16     | `mma.sync` + `ldmatrix` fragment loads | 61 TF/s |
 
 (Numbers are min-of-N timing on RTX 4090, single head, D=64; see
-`bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.4 is at
-~39% of peak — same shape as FlashAttention-2's reference forward kernel on
-this card.)
+`bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.4/10.5 are
+at ~39% of peak — same shape as FlashAttention-2's reference forward kernel
+on this card. The 10.5 vs 10.4 result — essentially tied — is itself a
+finding; see §11.)
 
 ### 5.1 The four shape variants
 
@@ -406,8 +408,9 @@ layout aligns with contiguous 32-bit groups in row-major storage, so the
 manual code is two `__half2` reads per lane per mma — clean and fast. V is
 the awkward case (B for P·V wants col-major while V is stored row-major),
 which costs us 4 scalar `__half` reads per lane per mma. `ldmatrix.x2.trans`
-would do this in one PTX instruction; left as further stretch in the §11
-ladder.
+would do this in one PTX instruction; that's the next rung — see §11
+(M10.5) for the swap-in and a discussion of why it doesn't actually move
+TF/s on this card without a swizzled smem layout.
 
 **At runtime** this kernel runs at ~62 TF/s at N=8192, ~2.2× over 10.3
 and ~39% of the cuBLAS hgemm peak. The remaining gap to the FA-2
@@ -420,14 +423,95 @@ The shared-memory footprint per block is `STAGES * 2 * BC4 * D4 * 2 = 16 KB`
 for the K/V tiles plus `WARPS * BR4 * D4 * 2 = 8 KB` for the Q tiles — 24 KB
 total, well under the 48 KB default.
 
-## 11. The four shape variants
+## 11. Rung 10.5 — `ldmatrix` fragment loads
+
+```c
+// kernels.cuh, flash_attention_mma_ldmatrix()
+// Identical tile shape and algorithm to 10.4. Only the Q and V
+// shared→register loads change.
+```
+
+10.4 packs the A and B operand registers by hand. For Q (A of `S = Q · K^T`)
+that's 4 `__half2` reads per lane per k-chunk — already efficient. For K
+(B of `S = Q · K^T` via K^T) that's 2 `__half2` reads per lane — also fine.
+The slow one is V (B of `O += P · V`): the B fragment for `m16n8k16` is
+col-major 16×8 but V is stored row-major, so each lane does 4 scalar
+`__half` reads per (p_chunk, d_chunk), and four lanes in the same t-group
+read the same byte offset across different rows — a high-conflict pattern.
+
+`ldmatrix.sync.aligned.m8n8.shared.b16` is the "right" way to feed
+`mma.sync` from shared memory: one warp-cooperative instruction loads
+8×8 fp16 tiles directly into the lane layout `mma.sync` expects. M13's
+`ldmatrix_example.cu` is the canonical reference for the lane→pointer
+mapping. The two flavors we use here:
+
+```ptx
+ldmatrix.sync.aligned.m8n8.x4.shared.b16  {r0,r1,r2,r3}, [smem];   // A side
+ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16  {r0,r1}, [smem];    // B side
+```
+
+**Q load (`.x4`).** A 16×16 A fragment = four 8×8 tiles. Lane L provides
+the row pointer for tile `L/8`, row `L%8`. The four returned `b32`
+registers per lane map directly to the `mma.sync` A operand `{a0,a1,a2,a3}`
+with no further packing — one PTX instruction per k-chunk replaces eight
+`__half2` reads.
+
+**V load (`.x2.trans`).** A 16×8 B fragment = two 8×8 tiles. Read row-major
+from shared, but the B operand wants col-major, so we use the `.trans`
+variant which transposes each 8×8 during the load. Lane L (0..15) provides
+`&Vs[(pc*16 + L) * D4 + dc*8]`; lanes 16..31's addresses are ignored. After
+the load, lane `(q,t)` holds `b0 = (rows 2t..2t+1, col q)` and
+`b1 = (rows 2t+8..2t+9, col q)` — the exact B layout `mma.sync` wants. One
+hardware instruction replaces four scalar `__half` reads per `(pc, dc)`.
+
+**K stays on the manual `__half2` path.** K is the B of `S = Q · K^T`, and
+because we store K row-major in shared and the `mma.sync` B layout wants
+col-major-of-the-16×8, the manual code happens to align with contiguous
+32-bit groups (two `__half2` per lane per mma) — no win to chase here.
+
+**Verification.** Identical `max_abs` to 10.4 at every N: 3.80e-5 / 1.71e-5
+/ 1.26e-5 at N ∈ {128, 1024, 2048}. The compiler emits 20 `LDSM` SASS
+instructions (4 Q + 16 V loads per outer iteration) replacing 64 vanilla
+`LDS` halves in 10.4.
+
+**Bench result — and why it's not the +10-15% you expect.** On RTX 4090
+sm_89, 10.5 measures essentially equal to 10.4: 61.0 vs 61.7 TF/s at
+N=8192 (within noise). Same registers (95), same shared (24 KB) — the
+kernels are byte-for-byte cousins on every metric except how the inner
+loop loads from shared.
+
+Why no speedup? `ldmatrix` is a necessary-but-not-sufficient step.
+The headline FA-2 / CUTLASS win from "use `ldmatrix`" really comes from
+**`ldmatrix` + a swizzled shared-memory layout**. With contiguous
+row-major V in shared (our case), the V-side `ldmatrix.x2.trans` hits
+the *same* bank-conflict pattern as the manual scalar loads: 16 lanes
+all reading the same column offset across different rows = a high-way
+conflict on the shared banks. The hardware's transposing wires save
+instruction count (20 LDSMs vs 64 LDS) but not the underlying memory-
+system throughput.
+
+To unlock the headline gain, the next step is to **swizzle** the K/V
+tiles when writing them to shared: each row's column indices XOR'd with
+a function of the row index, so a column-major read across rows hits
+different banks per lane. That's the change CUTLASS makes; it's a
+non-trivial rewrite of the `cp.async` `issue_tile` lambda and of the
+ldmatrix pointer math. Worth doing in a hypothetical 10.6; out of scope
+here.
+
+**Pedagogical takeaway.** Use `ldmatrix` to feed `mma.sync` — that's the
+production idiom. But don't expect it to be a free win on its own;
+without swizzled smem, you're trading the instruction-count cost for
+the same conflict-cost as the manual path. The win compounds with
+swizzle, and only with swizzle.
+
+## 12. The four shape variants
 
 Each of these is a thin overlay on the §3 loop. They're all written on top of
 the simple "one thread per Q row" base (10.0) because the shape concern is
 independent of the speed concern, and because reading them next to the base
 is the clearest way to see exactly what's added.
 
-### 11.A Causal masking with tile-skip
+### 12.A Causal masking with tile-skip
 
 For autoregressive (GPT-style) models the score matrix is lower-triangular:
 `S[i, j] = -∞ if j > i`. The naive way is to apply the mask per-element inside
@@ -445,7 +529,7 @@ below the diagonal need no mask at all.
 
 See `flash_attention_causal` in `kernels.cuh`.
 
-### 11.B KV-cache (the inference-time form of FA)
+### 12.B KV-cache (the inference-time form of FA)
 
 At inference, after the prefill phase the model processes one new token at a
 time. Each step:
@@ -465,7 +549,7 @@ total wall-clock at scale. Real implementations split it further by the
 "paged" attention pattern (vLLM); we're showing the contiguous-cache form for
 clarity.
 
-### 11.C Grouped-Query Attention (GQA)
+### 12.C Grouped-Query Attention (GQA)
 
 Llama-2/3, Mistral, and most modern open-weight inference models use GQA: the
 number of query heads `H_q` is larger than the number of KV heads `H_kv`,
@@ -480,7 +564,7 @@ practice.
 Algorithmically GQA is identical to MHA — just a different head-index
 mapping. See `flash_attention_gqa` in `kernels.cuh`.
 
-### 11.D What about porting these to 10.2 (WMMA)?
+### 12.D What about porting these to 10.2 (WMMA)?
 
 Mechanical, not free. The MHA wrapper is one extra index calculation at the
 top of the kernel — straightforward. Causal needs the tile-skip *and* a
@@ -489,7 +573,7 @@ per-tile mask: at WMMA granularity that means clobbering specific cells of
 cleanly into the existing dance. KV-cache and GQA are also pure index
 remapping. Recommended as the stretch exercise.
 
-## 12. Comparison: naive vs flash, and the ladder
+## 13. Comparison: naive vs flash, and the ladder
 
 `bench.cu` runs all rungs at `N ∈ {2048, 4096, 8192}, D = 64`:
 
@@ -501,6 +585,7 @@ remapping. Recommended as the stretch exercise.
 | 10.2 flash     | tensor-core inner matmul + softmax-on-fragments   | no             | 1 |
 | 10.3 flash     | 10.2 + double-buffered cp.async K/V loads         | no             | 1 |
 | 10.4 flash     | raw `mma.sync` + register-resident softmax        | no             | 1 |
+| 10.5 flash     | 10.4 + `ldmatrix` fragment loads (Q `.x4`, V `.x2.trans`) | no    | 1 |
 
 At small N (2048) the naive version's S/P matrices fit in L2 (17 MB) and the
 wall-clock gap to flash is small. At `N = 8192` (256 MB S/P), naive blows out
@@ -526,6 +611,16 @@ applied to the *same* algorithm:
   in the 4-lane t-group; per-iteration O-rescale by α is now a plain
   scalar multiply on a `float o_frag[8][4]` per lane. ~2.2× over 10.3 at
   N=8192. This is the FA-2-shape kernel.
+- 10.4 → 10.5: **`ldmatrix` fragment loads.** Replace the manual `__half2`
+  packing for Q (A operand) with `ldmatrix.x4` and the scalar-`__half`
+  packing for V (transposed B operand) with `ldmatrix.x2.trans`. The
+  instruction count drops (20 LDSMs replace 64 LDS halves) and the SASS
+  is the production FA-2 shape — but on this kernel the runtime is
+  essentially unchanged. The reason is bank conflicts on the V load: in
+  unswizzled row-major V, the 16-lane transposed read hits a single
+  bank-column across rows whether the load is `ldmatrix.x2.trans` or
+  manual. The full headline win requires `ldmatrix` *plus* a swizzled
+  shared-memory layout for K/V. See §11 for the full discussion.
 
 ---
 
@@ -552,16 +647,18 @@ each runs a host-side reference at small sizes (B=2, H=4, N=128, D=64).
   more of the K/V load latency. See M08 §3a for the deeper-pipeline pattern.
 - **Port the four shape variants to WMMA or mma.sync.** Take `flash_attention_wmma`
   (or `flash_attention_mma`) and add the MHA / causal / KV-cache / GQA overlays
-  from §11. Causal at WMMA granularity is the most interesting because the
+  from §12. Causal at WMMA granularity is the most interesting because the
   per-tile mask now applies to the materialized `Ssm` between
   `store_matrix_sync` and the row-softmax step. At raw `mma.sync` granularity,
   the mask is a per-lane register guard right after Q·Kᵀ — even cleaner.
-- **`ldmatrix` for the 10.4 fragment loads.** 10.4 packs the A / B operand
-  registers by hand. Swapping the Q and K loads for `ldmatrix.sync.aligned.
-  m8n8.x4.shared.b16` and the V load for `ldmatrix.x2.trans.shared.b16` (M13
-  `ldmatrix_example.cu` for the syntax) is the standard FA-2 / CUTLASS shape.
-  Expect ~10-15% headroom on top of 10.4's 62 TF/s on this card, mostly from
-  the V transpose disappearing into a single hardware-fused load.
+- **Swizzled shared memory for 10.5.** 10.5 swaps the manual fragment loads
+  for `ldmatrix` (`.x4` for Q, `.x2.trans` for V) but lands at the same
+  TF/s as 10.4 because the V transposed load still bank-conflicts with
+  row-major K/V in shared. The CUTLASS-style fix is to XOR-swizzle the
+  column index when writing K/V to shared (so a transposed read across
+  rows hits 16 different banks per lane). The `ldmatrix` pointer math
+  needs the same swizzle applied — straightforward but tedious. This
+  is the missing +10-15% on top of 10.5 on this card.
 - **FlashAttention-2 loop swap.** Swap the loop order so the outer loop is
   over the K/V tile and the inner is over the Q rows. The state machine
   becomes per-output-block instead of per-Q-row. ~2× faster than v1 in
