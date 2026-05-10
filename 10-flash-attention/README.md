@@ -154,15 +154,16 @@ three working kernels and a stretch spec:
 
 | Rung   | Kernel                          | Inputs   | Inner matmul        | Headline N=8192 |
 |--------|---------------------------------|----------|---------------------|-----------------|
-| 10.0   | `flash_attention`               | FP32     | per-thread scalar   | 6.5 TF/s        |
-| 10.1   | `flash_attention_warp`          | FP32     | per-thread scalar   | 9.2 TF/s        |
+| 10.0   | `flash_attention`               | FP32     | per-thread scalar   | 6.9 TF/s        |
+| 10.1   | `flash_attention_warp`          | FP32     | per-thread scalar   | 9.3 TF/s        |
 | 10.2   | `flash_attention_wmma`          | FP16     | WMMA tensor-cores   | 22 TF/s         |
 | 10.3   | `flash_attention_async_wmma`    | FP16     | WMMA + cp.async ×2  | 28 TF/s         |
+| 10.4   | `flash_attention_mma`           | FP16     | raw `mma.sync` + cp.async | 62 TF/s   |
 
 (Numbers are min-of-N timing on RTX 4090, single head, D=64; see
-`bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.3 is at
-~18% of peak — the softmax-on-fragments dance is now the single biggest
-cost left, and raw mma.sync is what closes the rest of the gap.)
+`bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.4 is at
+~39% of peak — same shape as FlashAttention-2's reference forward kernel on
+this card.)
 
 ### 5.1 The four shape variants
 
@@ -337,7 +338,87 @@ We use the legacy `__pipeline_memcpy_async` API from `<cuda_pipeline.h>`
 `gemm_v1_async`. The modern `cuda::pipeline` wrapper is functionally
 equivalent — see M08 §8.2 for the comparison.
 
-## 10. The four shape variants
+## 10. Rung 10.4 — Raw `mma.sync` (the FA-2 shape)
+
+```c
+// kernels.cuh, flash_attention_mma()
+// BR4 = 16, BC4 = 32, D4 = 64. WARPS_M10_4 = 4. STAGES = 2.
+// Block: 128 threads, BR4_BLOCK = 64 Q rows per block.
+```
+
+10.3 left two big costs on the table: the **softmax-on-fragments** round
+trip (store `S` to shared, read row-wise, write FP16 `P` back) and the
+**O-rescale** round trip (store `O` to shared, multiply by α row-wise,
+load back). Both exist because `wmma::fragment` has an *opaque* layout —
+the spec doesn't say which lane holds which element of the 16×16
+accumulator, so we can't operate on `o_frag.x[i]` row-aware in registers.
+
+Raw `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` fixes that. The
+PTX ISA documents the per-lane register layout exactly. For the D / C
+operand (FP32, 16×8):
+
+```
+Lane (q, t)   where  q = laneIdx / 4 ∈ [0,8),  t = laneIdx % 4 ∈ [0,4)
+  d[0] = (row q,   col 2t)        d[1] = (row q,   col 2t+1)
+  d[2] = (row q+8, col 2t)        d[3] = (row q+8, col 2t+1)
+```
+
+The instruction is m16-by-n8 — 16 rows of output, 8 cols. Each row is
+owned by 4 lanes (one `t`-group), each holding 2 of its 8 col entries.
+Row max and row sum become a tiny in-register reduction:
+
+```c
+v = fmaxf(d[0], d[1]);                                  // 2 cols local
+v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, 1));        // 4 cols
+v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, 2));        // 8 cols = full row
+```
+
+No shared memory. Same for the row-sum. And the per-lane O accumulator
+is just a `float o_frag[8][4]` — rescaling by α[row] is a plain scalar
+multiply on registers.
+
+The other thing we gain is the **register-resident P→A repack** for the
+P·V mma:
+
+```
+S frag for n=0 (cols 0..7) → A reg a0, a1     # row q   / row q+8
+S frag for n=1 (cols 8..15) → A reg a2, a3    # cols 0..7 / 8..15 of A frag
+```
+
+The D-fragment layout of a 16×8 mma output (over cols 0..7) plus the
+D-fragment layout of the adjacent mma (cols 8..15) is exactly the A-
+fragment layout of a 16×16 A input. So we convert the S-fragments to FP16
+*in-place per register*, no shuffle, and feed straight into the next mma.
+
+**Tile decomposition.** `S = Q · K^T` is 16×32 per warp:
+  * 4 mma `k`-tiles (D=64 / 16) × 4 mma `n`-tiles (BC=32 / 8) = 16 `mma.sync`s.
+`O += P · V` is 16×64 per warp:
+  * 2 mma `k`-tiles (BC=32 / 16) × 8 mma `n`-tiles (D=64 / 8) = 16 `mma.sync`s.
+
+We keep the M10.3 cp.async double-buffer pipeline — it's orthogonal to
+the softmax fix and free perf.
+
+**Manual fragment loads, not `ldmatrix`.** We pack A (Q) and B (K) operands
+by hand from shared memory with `__half2` loads. For Q and K the lane
+layout aligns with contiguous 32-bit groups in row-major storage, so the
+manual code is two `__half2` reads per lane per mma — clean and fast. V is
+the awkward case (B for P·V wants col-major while V is stored row-major),
+which costs us 4 scalar `__half` reads per lane per mma. `ldmatrix.x2.trans`
+would do this in one PTX instruction; left as further stretch in the §11
+ladder.
+
+**At runtime** this kernel runs at ~62 TF/s at N=8192, ~2.2× over 10.3
+and ~39% of the cuBLAS hgemm peak. The remaining gap to the FA-2
+production number (which lives around 60–80 TF/s on this card) is mostly
+the manual transposed V load and the lack of `ldmatrix` shared-bank
+swizzling — both pure constant-factor wins on top of the algorithmic shape
+this kernel already has.
+
+The shared-memory footprint per block is `STAGES * 2 * BC4 * D4 * 2 = 16 KB`
+for the K/V tiles plus `WARPS * BR4 * D4 * 2 = 8 KB` for the Q tiles — 24 KB
+total, well under the 48 KB default.
+
+## 11. The four shape variants
 
 Each of these is a thin overlay on the §3 loop. They're all written on top of
 the simple "one thread per Q row" base (10.0) because the shape concern is

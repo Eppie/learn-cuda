@@ -22,7 +22,7 @@ language sometimes hides.
 
 ---
 
-## 1. The compilation pipeline
+## The compilation pipeline
 
 ```
 .cu  ──────►  .ll      ──────►  .ptx          ──────►  .cubin       ──►  GPU
@@ -55,7 +55,7 @@ nvdisasm --print-instructions-only k.cubin                      # finer SASS
 The `Makefile` here exposes `make ptx` and `make sass` shortcuts for every
 example file in this directory.
 
-## 2. Reading PTX
+## Reading PTX
 
 Take the world's simplest kernel (`vector_add.cu`):
 
@@ -191,7 +191,7 @@ Things SASS shows that PTX hides:
 For most CUDA work you can stay in PTX; but if you're pushing the last
 microsecond out of a kernel, SASS is the truth.
 
-## 3. Inline PTX from CUDA C++
+## Inline PTX from CUDA C++
 
 The general form:
 
@@ -239,7 +239,7 @@ __restrict__ trap](#cache-modifiers-and-the-__restrict__-trap), below.
 `cp.async` PTX instruction. The committed `cpasync_inline.ptx` proves this
 side-by-side; see [§ cp.async PTX form](#cpasync-ptx-form), below.
 
-## 4. Cache modifiers and the __restrict__ trap
+## Cache modifiers and the __restrict__ trap
 
 This section earns its own number because it's the highest-density gotcha in
 the entire appendix. We'll work through `cache_hints.cu` line by line.
@@ -336,7 +336,7 @@ eviction. The reason to know about cache modifiers is the *non-streaming*
 case — kernels with mixed read patterns where you want to keep L1 for the
 hot data and bypass it for the cold streaming data.
 
-## 5. cp.async PTX form
+## cp.async PTX form
 
 `cpasync_inline.cu` puts the wrapper and inline forms side by side in the
 same compilation unit. The committed `cpasync_inline.ptx` (run `make ptx`
@@ -366,7 +366,7 @@ the copy with compute.
 
 For more on `cp.async` see Module 8.
 
-## 6. mma.sync vs WMMA
+## mma.sync vs WMMA
 
 `mma_sync_example.cu` runs exactly one
 `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` and verifies against
@@ -426,7 +426,7 @@ For lane `L` (with `g = L/4`, `t = L%4`):
 The full per-lane packing code is in `mma_sync_example.cu`; mirror it for
 your own kernels.
 
-## 7. ldmatrix — loading fragments from shared memory
+## ldmatrix: loading fragments from shared memory
 
 The natural input to `mma.sync` is fragments that came from shared memory
 (via `cp.async` from global). But the lane-element layout `mma.sync` expects
@@ -470,7 +470,7 @@ SASS from `ldmatrix_example.sass:253`:
 For an executable demo, run `./ldmatrix_example` — it loads 4 known 8×8
 matrices and dumps lane 0 and lane 7's holdings, plus a range check.
 
-## 8. SASS-level cycle counting with clock64()
+## SASS-level cycle counting with clock64()
 
 `clock_microbench.cu` brackets a tight FMA loop with `clock64()` reads to
 measure cycles per instruction. It demonstrates the difference between
@@ -547,7 +547,7 @@ Why care:
 bar.red.or.pred  %p1, 4, %p0;    // barrier 4, count = block size, OR of %p0
 ```
 
-## 9. When to actually write PTX
+## When to actually write PTX
 
 Almost never. Don't write PTX as your default. Reach for it when:
 
@@ -575,7 +575,7 @@ useful for understanding; writing it is rarely the right answer.
   Makefile               # builds binaries; `make ptx` and `make sass` dump
                          # the corresponding files for inspection
 
-  vector_add.cu          # the simple kernel from §2
+  vector_add.cu          # the simple kernel from § Reading PTX
   cache_hints.cu         # ld.global default vs .cg vs .nc, three-way
   cpasync_inline.cu      # __pipeline_memcpy_async wrapper vs raw cp.async PTX
   mma_sync_example.cu    # one-warp m16n8k16 mma.sync, verified vs host
@@ -588,7 +588,7 @@ useful for understanding; writing it is rarely the right answer.
 
 1. `make` to build the binaries.
 2. `make ptx` — generates `*.ptx` files. Open them in your editor and walk
-   through the PTX with the explanations in §2.
+   through the PTX with the explanations in the Reading PTX section.
 3. `make sass` — generates `*.sass` files. Compare against the PTX. Notice
    what changed (`ld.global.nc.f32` → `LDG.E.CONSTANT`, `mma.sync` →
    `HMMA.16816.F32`, `ldmatrix.x4` → `LDSM.16.M88.4`, etc.).
@@ -598,7 +598,7 @@ useful for understanding; writing it is rarely the right answer.
 5. Edit `cache_hints.cu` to add another inline-PTX variant (e.g. `.cs`
    streaming) and observe the SASS.
 
-## Cheat sheet — most-used inline PTX
+## Cheat sheet: most-used inline PTX
 
 ```cpp
 // Cached vs non-cached global loads

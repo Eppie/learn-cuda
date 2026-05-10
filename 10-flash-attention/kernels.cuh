@@ -1280,6 +1280,457 @@ inline void launch_flash_async_wmma(const __half* Q, const __half* K, const __ha
 }
 
 // ============================================================================
+// M10.4 — Raw mma.sync FlashAttention (FP16 inputs, FP32 accumulators).
+//
+// What changes vs M10.3 (cp.async + WMMA):
+//
+// M10.3 hits ~28 TF/s. The remaining cost (over the cuBLAS-hgemm peak of
+// ~160 TF/s on this card) is the softmax / O-rescale shared-memory round
+// trip: WMMA fragments have an opaque layout, so to do row-softmax on S we
+// must `store_matrix_sync(Ssm, s_frag)` and to rescale O by alpha we must
+// `store_matrix_sync(Osm, o_frag)`, scale, then `load_matrix_sync` back.
+// Both round-trips are pure overhead with no math content.
+//
+// Raw `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` exposes its
+// per-lane register layout exactly (PTX ISA §"MMA .m16n8k16 with .f16
+// floating-point type"). With that, we can:
+//   * Do row-softmax over S in registers via `__shfl_xor_sync` within the
+//     4-lane t-group that holds each row.
+//   * Rescale the per-lane O accumulator by alpha with a plain scalar
+//     multiply on registers — no shared trip at all.
+//   * Repack P → A-fragment in registers (P-chunk-n's D layout maps
+//     directly onto the A-fragment of the next mma).
+//
+// Fragment layout summary (m16n8k16, FP16 A/B, FP32 D, A row-major, B col-major):
+//
+//   Lane (q, t) where q = laneIdx / 4, t = laneIdx % 4.
+//
+//   D / C [16 × 8] FP32: 4 floats per lane, addressing
+//       d[0] = (q,   2t)     d[1] = (q,   2t+1)
+//       d[2] = (q+8, 2t)     d[3] = (q+8, 2t+1)
+//     So each row r ∈ [0,16) is owned by 4 lanes (one t-group). For r ∈
+//     [0,8) it lives in d[0,1] of lanes with q=r; for r ∈ [8,16) in d[2,3]
+//     of lanes with q=r-8.
+//
+//   A [16 × 16] FP16: 4 b32 regs per lane (a0..a3), packing 8 FP16:
+//       a0 = pair (q,   2t..2t+1)   a1 = pair (q+8, 2t..2t+1)
+//       a2 = pair (q,   2t+8..2t+9) a3 = pair (q+8, 2t+8..2t+9)
+//
+//   B [16 × 8] FP16, col-major: 2 b32 regs per lane (b0, b1):
+//       b0 = pair (2t..2t+1,   g)  b1 = pair (2t+8..2t+9, g)
+//
+// Tile shape (chosen to match M10.3 for an apples-to-apples comparison):
+//
+//   BR = 16 (rows of Q per warp, one mma.m16n8k16 A-tile row)
+//   BC = 32 (cols of K/V per inner tile, 4 mma n-tiles wide)
+//   D  = 64 (4 mma k-tiles in the Q · K^T reduction; 8 mma n-tiles in P · V)
+//   WARPS = 4 per block → BR_BLOCK = 64 Q rows per block
+//   STAGES = 2 cp.async double-buffer (reused from M10.3)
+//
+// Per-warp register state (each lane):
+//   o_frag[8][4]   FP32 — running output O, 16x64 (8 n-tiles × 4 elems/lane)
+//   m_state[2]     FP32 — running max for the 2 rows this lane owns (q, q+8)
+//   l_state[2]     FP32 — running sum for the 2 rows this lane owns
+//
+// Per-tile transient register state (each lane):
+//   s_frag[4][4]   FP32 — S = Q·K^T scaled, 16x32
+//   p_packed[2][4] b32  — P FP16 packed as A-fragment for P·V, 16x32 split
+//                         into 2 chunks of 16 (each is an A-input for mma)
+//
+// Online softmax in registers, per K-tile:
+//   1. Compute S = Q · K^T with 16 mma.sync (4 k-chunks × 4 n-chunks).
+//      Scale S by 1/sqrt(D).
+//   2. Mask OOB cols (last tile): for each lane, set s[n_chunk][i] = -INF
+//      where the corresponding (q', col) has col ≥ N.
+//   3. Per-row max: for each of the 2 rows this lane owns (q and q+8),
+//      reduce across the 4 t-group lanes via __shfl_xor_sync(., ., 1) then
+//      __shfl_xor_sync(., ., 2). All 4 lanes in the group end with the same
+//      row_max.
+//   4. Combine with running (m_state, l_state) → (m_new, alpha) per row.
+//   5. Apply alpha to the corresponding O slot in registers (no shared!):
+//        o_frag[d_chunk][0,1] *= alpha[row q]      // row q
+//        o_frag[d_chunk][2,3] *= alpha[row q+8]    // row q+8
+//   6. Compute P = exp(S - m_new), per-element. Pack into A-fragment for
+//      the next mma. Reduce row-sum of P across the t-group → l_ij.
+//   7. l_state = alpha * l_state + l_ij.
+//   8. O += P · V with 16 mma.sync (2 p-chunks × 8 d-chunks).
+//
+// At the end, divide each lane's O slots by its l_state.
+//
+// We keep the cp.async double-buffer pipeline from M10.3 since it's
+// orthogonal to the softmax change and free perf.
+// ============================================================================
+
+constexpr int BR4         = 16;
+constexpr int BC4         = 32;
+constexpr int D4          = 64;
+constexpr int WARPS_M10_4 = 4;
+constexpr int BR4_BLOCK   = BR4 * WARPS_M10_4;          // 64
+constexpr int M10_4_THREADS = WARPS_M10_4 * 32;         // 128
+constexpr int STAGES_M10_4 = 2;
+
+constexpr int N_CHUNKS_S = BC4 / 8;     // 4 (mma n-tiles wide in S)
+constexpr int K_CHUNKS_S = D4 / 16;     // 4 (mma k-tiles in Q·K^T)
+constexpr int D_CHUNKS_O = D4 / 8;      // 8 (mma n-tiles wide in O)
+constexpr int P_CHUNKS   = BC4 / 16;    // 2 (P split into A-frag chunks for P·V)
+
+// pack two halves into a b32 (low = x, high = y).
+__device__ __forceinline__ uint32_t pack_halves(__half x, __half y) {
+    uint32_t lo = *reinterpret_cast<uint16_t*>(&x);
+    uint32_t hi = *reinterpret_cast<uint16_t*>(&y);
+    return lo | (hi << 16);
+}
+__device__ __forceinline__ uint32_t pack_half2(__half2 v) {
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+
+// mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+__device__ __forceinline__ void mma_m16n8k16(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    float c0, float c1, float c2, float c3) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        :  "r"(a0),  "r"(a1),  "r"(a2),  "r"(a3),
+           "r"(b0),  "r"(b1),
+           "f"(c0),  "f"(c1),  "f"(c2),  "f"(c3));
+}
+
+__device__ __forceinline__ void m10_4_cp_async_16(void* smem_dst, const void* gmem_src) {
+    __pipeline_memcpy_async(smem_dst, gmem_src, sizeof(int4));
+}
+
+__global__ void flash_attention_mma(const __half* __restrict__ Q,
+                                    const __half* __restrict__ K,
+                                    const __half* __restrict__ V,
+                                    float*        __restrict__ O,
+                                    int N) {
+    int warp_id = threadIdx.x >> 5;
+    int lane    = threadIdx.x & 31;
+    int q_lane  = lane >> 2;    // 0..7
+    int t_lane  = lane & 3;     // 0..3
+
+    int row_base = blockIdx.x * BR4_BLOCK + warp_id * BR4;
+
+    // The 2 rows of D / C / softmax-output this lane owns are q_lane and q_lane+8.
+    int row_top = row_base + q_lane;       // for d[0], d[1]
+    int row_bot = row_base + q_lane + 8;   // for d[2], d[3]
+
+    // Block-shared: K/V double-buffered tiles.
+    __shared__ __half Ks[STAGES_M10_4][BC4 * D4];
+    __shared__ __half Vs[STAGES_M10_4][BC4 * D4];
+
+    // Per-warp shared: Q (16×64 fp16). Loaded once at kernel entry.
+    __shared__ __half Qs_blk[WARPS_M10_4][BR4 * D4];
+    __half* Qs = Qs_blk[warp_id];
+
+    // ---- Stage Q for this warp ----
+    for (int idx = lane; idx < BR4 * D4; idx += 32) {
+        int r = idx / D4;
+        int d = idx % D4;
+        int row = row_base + r;
+        Qs[r * D4 + d] = (row < N) ? Q[row * D4 + d] : __float2half(0.0f);
+    }
+    __syncwarp();
+
+    // ---- Pre-load Q A-fragments for all 4 k-chunks ----
+    // q_frag[k_chunk][0..3] hold a0..a3 per the layout above.
+    uint32_t q_frag[K_CHUNKS_S][4];
+    #pragma unroll
+    for (int kk = 0; kk < K_CHUNKS_S; ++kk) {
+        // Read 4 __half2 per lane. Q rows q_lane and q_lane+8, cols
+        // kk*16+2t..kk*16+2t+1 and kk*16+2t+8..kk*16+2t+9.
+        __half2 a01 = *reinterpret_cast<__half2*>(
+            &Qs[q_lane * D4 + kk * 16 + 2 * t_lane]);
+        __half2 a23 = *reinterpret_cast<__half2*>(
+            &Qs[(q_lane + 8) * D4 + kk * 16 + 2 * t_lane]);
+        __half2 a45 = *reinterpret_cast<__half2*>(
+            &Qs[q_lane * D4 + kk * 16 + 2 * t_lane + 8]);
+        __half2 a67 = *reinterpret_cast<__half2*>(
+            &Qs[(q_lane + 8) * D4 + kk * 16 + 2 * t_lane + 8]);
+        q_frag[kk][0] = pack_half2(a01);
+        q_frag[kk][1] = pack_half2(a23);
+        q_frag[kk][2] = pack_half2(a45);
+        q_frag[kk][3] = pack_half2(a67);
+    }
+
+    // ---- O accumulator: 8 d-chunks × 4 floats per lane ----
+    float o_frag[D_CHUNKS_O][4];
+    #pragma unroll
+    for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+        o_frag[dc][0] = 0.0f; o_frag[dc][1] = 0.0f;
+        o_frag[dc][2] = 0.0f; o_frag[dc][3] = 0.0f;
+    }
+
+    // ---- Per-row state (2 rows per lane) ----
+    float m_state[2] = {-INFINITY, -INFINITY};
+    float l_state[2] = {0.0f, 0.0f};
+
+    const float scale = 1.0f / sqrtf((float)D4);
+    int Tc = (N + BC4 - 1) / BC4;
+
+    // ---- cp.async issuance helper for one tile ----
+    // BC4 * D4 = 32 * 64 = 2048 halves = 4096 B per K-tile (and per V-tile).
+    // With 128 threads * 16 B per cp.async = 2048 B per pass → 2 passes per tile.
+    auto issue_tile = [&](int stage, int j, bool may_be_oob) {
+        constexpr int VEC_HALVES   = 8;             // 16 B = 8 fp16
+        constexpr int VECS_PER_ROW = D4 / VEC_HALVES;       // 8
+        constexpr int N_TRANSFERS  = (BC4 * D4) / VEC_HALVES; // 256
+        constexpr int PASSES       = N_TRANSFERS / M10_4_THREADS; // 2
+
+        #pragma unroll
+        for (int p = 0; p < PASSES; ++p) {
+            int t = p * M10_4_THREADS + threadIdx.x;
+            int row_in_tile = t / VECS_PER_ROW;
+            int col_in_row  = (t % VECS_PER_ROW) * VEC_HALVES;
+            int kcol = j * BC4 + row_in_tile;
+            int src_row = may_be_oob ? ((kcol < N) ? kcol : (N - 1)) : kcol;
+
+            __half*       k_smem = &Ks[stage][row_in_tile * D4 + col_in_row];
+            __half*       v_smem = &Vs[stage][row_in_tile * D4 + col_in_row];
+            const __half* k_gmem = &K[src_row * D4 + col_in_row];
+            const __half* v_gmem = &V[src_row * D4 + col_in_row];
+
+            m10_4_cp_async_16(k_smem, k_gmem);
+            m10_4_cp_async_16(v_smem, v_gmem);
+        }
+    };
+
+    // ---- Prologue: kick off tile 0 ----
+    if (Tc > 0) issue_tile(0, 0, /*may_be_oob=*/(Tc == 1));
+    __pipeline_commit();
+
+    int compute_stage = 0;
+    int load_stage    = 1 % STAGES_M10_4;
+
+    for (int j = 0; j < Tc; ++j) {
+        // Next-tile prefetch.
+        if (j + 1 < Tc) {
+            issue_tile(load_stage, j + 1, /*may_be_oob=*/(j + 2 == Tc));
+        }
+        __pipeline_commit();
+
+        __pipeline_wait_prior(STAGES_M10_4 - 1);
+        __syncthreads();
+
+        __half* Ks_cur = Ks[compute_stage];
+        __half* Vs_cur = Vs[compute_stage];
+
+        // ---------------- S = Q · K^T (in registers) ----------------
+        // s_frag[n_chunk][i]: lane (q, t) holds D-output of mma n=n_chunk:
+        //   s[n_chunk][0] = (q, 2t)      s[n_chunk][1] = (q, 2t+1)
+        //   s[n_chunk][2] = (q+8, 2t)    s[n_chunk][3] = (q+8, 2t+1)
+        // s S-column indexed by (n_chunk, 2t/2t+1) → S col = n_chunk*8 + 2t/2t+1.
+        float s_frag[N_CHUNKS_S][4];
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            s_frag[n][0] = 0.0f; s_frag[n][1] = 0.0f;
+            s_frag[n][2] = 0.0f; s_frag[n][3] = 0.0f;
+        }
+
+        #pragma unroll
+        for (int kk = 0; kk < K_CHUNKS_S; ++kk) {
+            #pragma unroll
+            for (int n = 0; n < N_CHUNKS_S; ++n) {
+                // B = K^T 16×8: lane holds b0 = K[n*8 + g, kk*16 + 2t..2t+1],
+                //                          b1 = K[n*8 + g, kk*16 + 2t+8..2t+9].
+                int k_row = n * 8 + q_lane;
+                __half2 b0v = *reinterpret_cast<__half2*>(
+                    &Ks_cur[k_row * D4 + kk * 16 + 2 * t_lane]);
+                __half2 b1v = *reinterpret_cast<__half2*>(
+                    &Ks_cur[k_row * D4 + kk * 16 + 2 * t_lane + 8]);
+                uint32_t b0 = pack_half2(b0v);
+                uint32_t b1 = pack_half2(b1v);
+
+                mma_m16n8k16(s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3],
+                             q_frag[kk][0], q_frag[kk][1], q_frag[kk][2], q_frag[kk][3],
+                             b0, b1,
+                             s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3]);
+            }
+        }
+
+        // ---- Scale by 1/sqrt(D), apply OOB mask ----
+        // Lane (q, t)'s S col for slot i ∈ [0,3]:
+        //   i=0,2: col = n_chunk*8 + 2*t
+        //   i=1,3: col = n_chunk*8 + 2*t + 1
+        // Mask only on the last tile.
+        bool last_tile = (j == Tc - 1);
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            int col0 = n * 8 + 2 * t_lane;
+            int col1 = col0 + 1;
+            int kcol0 = j * BC4 + col0;
+            int kcol1 = j * BC4 + col1;
+            bool m0 = last_tile && (kcol0 >= N);
+            bool m1 = last_tile && (kcol1 >= N);
+            s_frag[n][0] = m0 ? -INFINITY : (s_frag[n][0] * scale);
+            s_frag[n][1] = m1 ? -INFINITY : (s_frag[n][1] * scale);
+            s_frag[n][2] = m0 ? -INFINITY : (s_frag[n][2] * scale);
+            s_frag[n][3] = m1 ? -INFINITY : (s_frag[n][3] * scale);
+        }
+
+        // ---------------- Row max via __shfl_xor in the t-group ----------------
+        // Each row of S is held across 4 lanes (same q_lane, t_lane = 0..3).
+        // For each row, the 8 values held by the 4 lanes (2 per lane per
+        // n_chunk × 4 n_chunks = 8 per lane) are reduced.
+        // row 0 = row "top" = q_lane; uses s_frag[*][0,1]
+        // row 1 = row "bot" = q_lane + 8; uses s_frag[*][2,3]
+
+        float row_max_top = -INFINITY;
+        float row_max_bot = -INFINITY;
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            row_max_top = fmaxf(row_max_top, fmaxf(s_frag[n][0], s_frag[n][1]));
+            row_max_bot = fmaxf(row_max_bot, fmaxf(s_frag[n][2], s_frag[n][3]));
+        }
+        // XOR-reduce across the 4-lane t-group.
+        row_max_top = fmaxf(row_max_top, __shfl_xor_sync(0xffffffff, row_max_top, 1));
+        row_max_top = fmaxf(row_max_top, __shfl_xor_sync(0xffffffff, row_max_top, 2));
+        row_max_bot = fmaxf(row_max_bot, __shfl_xor_sync(0xffffffff, row_max_bot, 1));
+        row_max_bot = fmaxf(row_max_bot, __shfl_xor_sync(0xffffffff, row_max_bot, 2));
+
+        // Online softmax combine (two rows per lane).
+        float m_new_top = fmaxf(m_state[0], row_max_top);
+        float m_new_bot = fmaxf(m_state[1], row_max_bot);
+        float alpha_top = (m_state[0] == -INFINITY) ? 0.0f : __expf(m_state[0] - m_new_top);
+        float alpha_bot = (m_state[1] == -INFINITY) ? 0.0f : __expf(m_state[1] - m_new_bot);
+
+        // ---------------- Apply alpha to per-lane O (REGISTER-RESIDENT) ----------------
+        // o_frag[dc][0,1] are row "top" (q_lane). [2,3] are row "bot" (q_lane+8).
+        #pragma unroll
+        for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+            o_frag[dc][0] *= alpha_top;
+            o_frag[dc][1] *= alpha_top;
+            o_frag[dc][2] *= alpha_bot;
+            o_frag[dc][3] *= alpha_bot;
+        }
+
+        // ---------------- Compute P = exp(S - m_new), per-element row-sum ----------------
+        float l_ij_top = 0.0f;
+        float l_ij_bot = 0.0f;
+        // p_vals[n_chunk][i]: P in fp32 form.
+        float p_vals[N_CHUNKS_S][4];
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            float p0 = (s_frag[n][0] == -INFINITY) ? 0.0f : __expf(s_frag[n][0] - m_new_top);
+            float p1 = (s_frag[n][1] == -INFINITY) ? 0.0f : __expf(s_frag[n][1] - m_new_top);
+            float p2 = (s_frag[n][2] == -INFINITY) ? 0.0f : __expf(s_frag[n][2] - m_new_bot);
+            float p3 = (s_frag[n][3] == -INFINITY) ? 0.0f : __expf(s_frag[n][3] - m_new_bot);
+            p_vals[n][0] = p0; p_vals[n][1] = p1;
+            p_vals[n][2] = p2; p_vals[n][3] = p3;
+            l_ij_top += p0 + p1;
+            l_ij_bot += p2 + p3;
+        }
+        l_ij_top += __shfl_xor_sync(0xffffffff, l_ij_top, 1);
+        l_ij_top += __shfl_xor_sync(0xffffffff, l_ij_top, 2);
+        l_ij_bot += __shfl_xor_sync(0xffffffff, l_ij_bot, 1);
+        l_ij_bot += __shfl_xor_sync(0xffffffff, l_ij_bot, 2);
+
+        l_state[0] = alpha_top * l_state[0] + l_ij_top;
+        l_state[1] = alpha_bot * l_state[1] + l_ij_bot;
+        m_state[0] = m_new_top;
+        m_state[1] = m_new_bot;
+
+        // ---------------- Repack P into A-fragment layout for P·V ----------------
+        // P is 16 × BC4 = 16 × 32. Split into BC4/16 = 2 chunks of 16 cols each.
+        // Each chunk is an mma.A operand 16×16. For chunk pc:
+        //   - P_cols [pc*16 .. pc*16+15] map to S n_chunks {2*pc, 2*pc+1}.
+        //   - Lane (q, t) for the A-fragment: 4 b32 regs (8 fp16).
+        //     a0 = pair (q,   2t..2t+1)   ← from n_chunk = 2*pc, slots p[0], p[1]
+        //     a1 = pair (q+8, 2t..2t+1)   ← from n_chunk = 2*pc, slots p[2], p[3]
+        //     a2 = pair (q,   2t+8..2t+9) ← from n_chunk = 2*pc+1, slots p[0], p[1]
+        //     a3 = pair (q+8, 2t+8..2t+9) ← from n_chunk = 2*pc+1, slots p[2], p[3]
+        //
+        // So the D-fragment layout of the S mma's n_chunks {2pc, 2pc+1} maps
+        // directly onto the A-fragment of the next mma. NO cross-lane shuffle.
+        uint32_t p_frag[P_CHUNKS][4];
+        #pragma unroll
+        for (int pc = 0; pc < P_CHUNKS; ++pc) {
+            int n0 = 2 * pc;
+            int n1 = 2 * pc + 1;
+            p_frag[pc][0] = pack_halves(__float2half(p_vals[n0][0]), __float2half(p_vals[n0][1]));
+            p_frag[pc][1] = pack_halves(__float2half(p_vals[n0][2]), __float2half(p_vals[n0][3]));
+            p_frag[pc][2] = pack_halves(__float2half(p_vals[n1][0]), __float2half(p_vals[n1][1]));
+            p_frag[pc][3] = pack_halves(__float2half(p_vals[n1][2]), __float2half(p_vals[n1][3]));
+        }
+
+        // ---------------- O += P · V ----------------
+        // V is 32×64. Reduce dim = 32 (P col / V row). Split into 2 chunks of 16.
+        // Output dim = 64. Split into 8 chunks of 8 (mma n).
+        //
+        // For each (p_chunk pc, output chunk dc):
+        //   A = p_frag[pc] (16×16)
+        //   B = V[pc*16..pc*16+15 rows, dc*8..dc*8+7 cols] read as col-major
+        //   Accumulate into o_frag[dc] in place.
+        #pragma unroll
+        for (int pc = 0; pc < P_CHUNKS; ++pc) {
+            #pragma unroll
+            for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+                int v_col = dc * 8 + q_lane;
+                int v_base = pc * 16;
+                // B fragment for m16n8k16: lane (q, t) holds:
+                //   b0 = pair (k=2t..2t+1, n=g)
+                //   b1 = pair (k=2t+8..2t+9, n=g)
+                // n = q_lane → output col index within chunk = q_lane.
+                // k = reduce row → V row in chunk = pc*16 + k.
+                __half b0_lo = Vs_cur[(v_base + 2 * t_lane    ) * D4 + v_col];
+                __half b0_hi = Vs_cur[(v_base + 2 * t_lane + 1) * D4 + v_col];
+                __half b1_lo = Vs_cur[(v_base + 2 * t_lane + 8) * D4 + v_col];
+                __half b1_hi = Vs_cur[(v_base + 2 * t_lane + 9) * D4 + v_col];
+                uint32_t b0 = pack_halves(b0_lo, b0_hi);
+                uint32_t b1 = pack_halves(b1_lo, b1_hi);
+
+                mma_m16n8k16(o_frag[dc][0], o_frag[dc][1], o_frag[dc][2], o_frag[dc][3],
+                             p_frag[pc][0], p_frag[pc][1], p_frag[pc][2], p_frag[pc][3],
+                             b0, b1,
+                             o_frag[dc][0], o_frag[dc][1], o_frag[dc][2], o_frag[dc][3]);
+            }
+        }
+
+        // WAR fence: under STAGES=2, next iter's cp.async writes the buffer
+        // we just consumed.
+        __syncthreads();
+
+        compute_stage = (compute_stage + 1) % STAGES_M10_4;
+        load_stage    = (load_stage    + 1) % STAGES_M10_4;
+    }
+
+    // ---------------- Normalize and write O ----------------
+    // Lane (q, t) owns:
+    //   o_frag[dc][0,1] for row row_top, cols dc*8 + 2t and 2t+1
+    //   o_frag[dc][2,3] for row row_bot, cols dc*8 + 2t and 2t+1
+    float inv_l_top = (l_state[0] > 0.0f) ? (1.0f / l_state[0]) : 0.0f;
+    float inv_l_bot = (l_state[1] > 0.0f) ? (1.0f / l_state[1]) : 0.0f;
+
+    #pragma unroll
+    for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+        int col0 = dc * 8 + 2 * t_lane;
+        int col1 = col0 + 1;
+        if (row_top < N) {
+            O[row_top * D4 + col0] = o_frag[dc][0] * inv_l_top;
+            O[row_top * D4 + col1] = o_frag[dc][1] * inv_l_top;
+        }
+        if (row_bot < N) {
+            O[row_bot * D4 + col0] = o_frag[dc][2] * inv_l_bot;
+            O[row_bot * D4 + col1] = o_frag[dc][3] * inv_l_bot;
+        }
+    }
+}
+
+inline void launch_flash_mma(const __half* Q, const __half* K, const __half* V,
+                             float* O, int N) {
+    dim3 block(M10_4_THREADS);
+    dim3 grid((N + BR4_BLOCK - 1) / BR4_BLOCK);
+    flash_attention_mma<<<grid, block>>>(Q, K, V, O, N);
+}
+
+// ============================================================================
 // Naive reference: three kernels, materialized N×N attention matrix.
 // (Single-head only — used by bench.cu for the headline comparison. Multi-head
 // references for the new variants live in solution.cu as host-side functions.)

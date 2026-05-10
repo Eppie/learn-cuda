@@ -61,8 +61,10 @@ static void run_for_size(int N) {
         CUDA_CHECK(cudaMemset(d_Vh, 0, N * D * sizeof(__half)));
         auto flash_wmma       = [&] { launch_flash_wmma      (d_Qh, d_Kh, d_Vh, d_O, N); };
         auto flash_async_wmma = [&] { launch_flash_async_wmma(d_Qh, d_Kh, d_Vh, d_O, N); };
+        auto flash_mma        = [&] { launch_flash_mma       (d_Qh, d_Kh, d_Vh, d_O, N); };
         report("10.2 flash WMMA (fp16 in)",        bench(flash_wmma));
         report("10.3 flash cp.async + WMMA",       bench(flash_async_wmma));
+        report("10.4 flash raw mma.sync",          bench(flash_mma));
         CUDA_CHECK(cudaFree(d_Qh));
         CUDA_CHECK(cudaFree(d_Kh));
         CUDA_CHECK(cudaFree(d_Vh));
