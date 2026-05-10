@@ -118,7 +118,7 @@ combines five modules' worth of techniques. Budget accordingly.
 | Required from | What | Why |
 |---------------|------|-----|
 | **M06 v6**    | Working warp-tiled GEMM with verify | The two projections are GEMMs |
-| **M07 v0**    | At least the WMMA baseline working | If you go FP16 you'll want this |
+| **M07 v0** *or* **M10.2** | At least one WMMA kernel working — either `gemm_v0_wmma` (M07) or `flash_attention_wmma` (M10.2). The latter is closer to what Project A needs and is a faster on-ramp to the Strong / Production tiers. | Strong tier (≥25 TF/s) and above need WMMA inside the inner matmuls |
 | **M09 fused** | LayerNorm + softmax fused kernels  | Activation between projections |
 | **M11 events**       | `cudaEventRecord` / `cudaStreamWaitEvent` | Stream-sync for the pipeline |
 | **M11 persistent**   | Working persistent-kernel demo | One option for ultra-low-latency |

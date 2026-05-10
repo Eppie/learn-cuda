@@ -163,6 +163,25 @@ Every module ends with a **profiler checklist** — run Nsight Compute on your b
 - For profiling: `ncu` (Nsight Compute) and `nsys` (Nsight Systems) — both ship with the CUDA toolkit
 - `compute-sanitizer` (also bundled with the toolkit) — used from M04 onward
 
+### Running on WSL2
+
+The course was developed and benched on RTX 4090 + WSL2. Most things work
+identically to bare-metal Linux. Watch out for:
+
+- **Unified-memory prefetch is unavailable.** `cudaDevAttrConcurrentManagedAccess
+  == 0` on WSL2, so `cudaMemPrefetchAsync` no-ops. M11's `events_demo` detects
+  this and skips the prefetch test. On bare-metal Linux it works.
+- **`nsys` GPU-side traces are limited.** WSL2 captures host-side CUDA-API
+  trace cleanly, but per-kernel GPU timeline rows are sparse. M04 documents
+  this; for full timeline-level profiling, run on bare metal.
+- **`ncu-ui` doesn't run inside WSL2.** Use `ncu --export report.ncu-rep
+  ./bench` in WSL, then open the report in Windows-native `ncu-ui`.
+- **Doorbell round-trips have a wider noise floor.** M11 measured 2.04 µs
+  on idle WSL2; expect 1–2 µs on bare-metal Linux with C-state pinning.
+
+None of these are blockers — the entire course builds, runs, and verifies
+under WSL2.
+
 ## Build
 
 ```bash

@@ -234,9 +234,9 @@ On a weakly-ordered CPU (AArch64, POWER) this is a bug: insert a
 stores, and prefer `std::atomic` with explicit release-semantics on the
 doorbell. Don't port this pattern off x86 without auditing for that.
 
-> Forward-ref: see appendix 13 for the PTX form of `__threadfence` /
-> `__threadfence_system` (`membar.gl` / `membar.sys`) and the SASS
-> equivalents.
+> Forward-ref: see [Appendix 13 § __threadfence and PTX memory ordering](../13-ptx-appendix/README.md#__threadfence-and-ptx-memory-ordering)
+> for the PTX form of `__threadfence` / `__threadfence_system` (`membar.gl`
+> / `membar.sys`) and the SASS equivalents.
 
 ## 5. The kernel queue: SPSC ring buffer + persistent consumer
 

@@ -410,9 +410,13 @@ Look at:
 - The 16-byte shared-memory loads tensor cores need expose bank-conflict
   patterns the +1-padding fix from Module 3 doesn't solve. Padded layouts
   or XOR-swizzles are the real fix; see §3.
-- A working but unoptimized WMMA kernel typically lands at 30–40 % of
-  cuBLAS. The big remaining wins are *async copy + double buffering*
-  (Module 8) and bank-conflict-free shared layouts (this module §3).
+- Measured on RTX 4090 at 4096³ FP16-in / FP32-acc: WMMA v0 lands at
+  **~40% of cuBLAS hgemm** (62.9 / 159.0 TFLOPs). Adding shared-memory
+  swizzling (v1) doesn't move it — the bottleneck is elsewhere. Raw
+  `mma.sync` (v2), which exposes the documented fragment layout and lets
+  the compiler keep more of the working set in registers, hits **~76%
+  of cuBLAS** (120.7 TFLOPs). The remaining gap is hand-tuned scheduling
+  (CUTLASS / cuBLAS internals) and `cp.async` double-buffering (M08).
 - Restructuring around 16-element tiles is the price of admission.
 - Hopper adds DSMEM (cross-block shared memory in clusters), TMA
   (`cp.async.bulk.tensor`), and `wgmma` (warp-group async MMA). Ada has

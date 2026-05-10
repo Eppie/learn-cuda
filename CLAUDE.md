@@ -25,14 +25,20 @@ Modules with extra structure:
 - **`06-gemm`** — `kernels.cuh` (v0..v6 ladder), `gemm.h` (verify helper).
   v6 is the **full Boehm warp-tiled** kernel (WSUBM/WSUBN sub-tiling); v5
   splits into 5a (vectorized) and 5b (transposed As).
-- **`07-tensor-cores`** — `kernels.cuh`, `gemm_tc.h`. M07's WMMA kernel
-  evolves from M06 v6 (same launcher / tile params, inner FMA loop replaced
-  with WMMA fragments).
+- **`07-tensor-cores`** — `kernels.cuh`, `gemm_tc.h`. Three sub-kernels:
+  `gemm_v0_wmma` (evolves from M06 v6 — same launcher / tile params, inner
+  FMA loop replaced with WMMA fragments), `gemm_v1_wmma_swizzled` (adds
+  shared-memory swizzling), `gemm_v2_mma_sync` (raw mma.sync PTX, hits ~76%
+  of cuBLAS hgemm vs ~40% for WMMA).
 - **`09-fused-epilogues`** — `kernels.cuh` covers softmax, online softmax,
   Welford LayerNorm, LN+residual, FP16 LN, GEMM+bias+GELU (post-pass and
   fused).
-- **`10-flash-attention`** — `kernels.cuh` covers FA-1, MHA, causal+tile-skip,
-  KV-cache, GQA.
+- **`10-flash-attention`** — `kernels.cuh` covers two ladders side by side.
+  *Optimization ladder*: `flash_attention` (10.0, one thread per Q row, FP32),
+  `flash_attention_warp` (10.1, bigger blocks for better K-tile amortization),
+  `flash_attention_wmma` (10.2, FP16 inputs / FP32 acc / WMMA inner matmul,
+  ~3.3× over 10.0). *Shape variants on the simple base*: MHA, causal+tile-skip,
+  KV-cache, GQA. M10.3 (cp.async + WMMA) is documented as a stretch spec.
 - **`11-low-latency`** — multiple demo files: `bench.cu`, `events_demo.cu`,
   `persistent_demo.cu`, `ring_buffer.cu`. Module README is structured in
   sub-sections (§4 doorbell → §5 ring → §6 megakernel → §7 Green Contexts
