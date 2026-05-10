@@ -68,9 +68,9 @@ is masked).
 |------|---------------|---------------------------|---------|
 | **Passing**  | FP32, multi-head + causal, no tile-skip | ≥ 8 TF/s | Baseline; what `kernels.cuh` ships should hit. |
 | **Solid**    | FP32 + tile-skip stretch | ≥ 14 TF/s on `causal=true` | ~1.6× speedup over no-skip. |
-| **Strong**   | FP16 inputs, FP32 accumulator (no tensor cores) | ≥ 25 TF/s | Half the bandwidth, same arithmetic. |
-| **Production-shaped** | FP16 + WMMA inner matmul | ≥ 50 TF/s | Conservative; real FA-1 hits ~110 TF/s of useful work on Ada. Aim higher. |
-| **Stretch (advanced)** | FP16 + `mma.sync` + `cp.async` double-buffer | ≥ 90 TF/s | Don't be surprised if you can't get here without recreating CUTLASS internals. |
+| **Strong**   | FP16 inputs, FP32 accumulator (no tensor cores) | ≥ 25 TF/s | Half the bandwidth, same arithmetic. Reachable directly by porting M10.2 (`flash_attention_wmma`) to MHA + causal. |
+| **Production-shaped** | FP16 + WMMA inner matmul + `cp.async` | ≥ 50 TF/s | Reachable directly by porting M10.3 (`flash_attention_async_wmma`) to MHA + causal — single-head 10.3 hits 26 TF/s, multi-head should match. |
+| **Stretch (advanced)** | FP16 + raw `mma.sync` + `cp.async` | ≥ 90 TF/s | Single-head M10.4 (`flash_attention_mma`) hits ~59 TF/s; porting to MHA + causal + adding `ldmatrix.x2.trans` for the V-as-B load should clear 90 TF/s. The remaining gap to cuBLAS+cuDNN is CUTLASS-quality scheduling. |
 
 These are *output* TFLOPs (useful work), not raw HMMA peak. Don't be alarmed if
 your `nsys`/`ncu` profile reports a different number for "tensor-core utilization"
