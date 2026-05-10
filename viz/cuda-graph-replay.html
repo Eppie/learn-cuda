@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CUDA Graph replay vs sequential launches (M11)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+const root = document.getElementById("root");
+vizlib.header(root, "CUDA Graph replay vs sequential launches (M11)",
+  "Sequential cudaLaunchKernel calls each carry ~1.5–3 µs of host-side launch overhead (driver + " +
+  "queueing). For pipelines with many short kernels, that overhead dominates. cudaGraph captures the " +
+  "DAG once; cudaGraphLaunch replays it with a single launch entry. The two timelines below compare " +
+  "5 short kernels in sequential vs graph-replay mode; total wall-time difference shows the savings.");
+
+const ctrls = vizlib.html("div", { class: "controls" });
+root.appendChild(ctrls);
+const state = { numKernels: 5, kernelDur: 3, launchOH: 2, graphOH: 4, playing: false, t: 0 };
+
+ctrls.appendChild(vizlib.slider({ min: 2, max: 12, step: 1, value: 5, label: "# kernels",
+  onChange: v => { state.numKernels = v; reset(); } }).node);
+ctrls.appendChild(vizlib.slider({ min: 1, max: 10, step: 1, value: 3, label: "kernel time (µs)",
+  onChange: v => { state.kernelDur = v; reset(); } }).node);
+ctrls.appendChild(vizlib.slider({ min: 1, max: 5, step: 1, value: 2, label: "launch OH (µs)",
+  onChange: v => { state.launchOH = v; reset(); } }).node);
+ctrls.appendChild(vizlib.button("◀ rewind", () => reset()));
+ctrls.appendChild(vizlib.button("step ▶", () => { state.t = Math.min(state.t+2, totalTime()); render(); }));
+const pB = vizlib.button("play", () => togglePlay());
+ctrls.appendChild(pB);
+
+const info = vizlib.html("div", { class: "panel stats" });
+root.appendChild(info);
+const svgWrap = vizlib.html("div", { class: "panel" });
+root.appendChild(svgWrap);
+
+function totalTime() {
+  const seq   = state.numKernels * (state.launchOH + state.kernelDur);
+  const graph = state.graphOH + state.numKernels * state.kernelDur;
+  return Math.max(seq, graph) + 4;
+}
+function reset() { state.t = 0; state.playing = false; pB.textContent = "play"; render(); }
+function togglePlay() {
+  state.playing = !state.playing;
+  pB.textContent = state.playing ? "pause" : "play";
+  if (state.playing) tick();
+}
+function tick() {
+  if (!state.playing) return;
+  if (state.t >= totalTime()) { state.playing = false; pB.textContent = "play"; return; }
+  state.t += 1; render();
+  setTimeout(tick, 200);
+}
+
+function render() {
+  svgWrap.innerHTML = "";
+  const W = 1100, H = 320, padL = 110, padR = 30;
+  const tEnd = totalTime();
+  const colW = (W-padL-padR) / tEnd;
+  const svg = vizlib.el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+
+  function drawTimeline(yTop, label, segments) {
+    svg.appendChild(vizlib.el("text", { x: 10, y: yTop+18, "font-size": 12, "font-weight": "bold" })).textContent = label;
+    svg.appendChild(vizlib.el("line", { x1: padL, y1: yTop+30, x2: W-padR, y2: yTop+30, stroke: "#bbb" }));
+    let totalDur = 0;
+    for (const s of segments) {
+      if (s.start > state.t) continue;
+      const drawW = Math.min(s.end, state.t) - s.start;
+      if (drawW <= 0) continue;
+      svg.appendChild(vizlib.el("rect", {
+        x: padL + s.start*colW, y: yTop+10, width: drawW*colW, height: 40,
+        fill: s.color, stroke: "#333", "stroke-width": 0.5, rx: 3,
+      }));
+      if (drawW*colW > 30) {
+        svg.appendChild(vizlib.el("text", { x: padL + (s.start+drawW/2)*colW, y: yTop+34,
+          "text-anchor": "middle", "font-size": 11, fill: "#fff" })).textContent = s.label;
+      }
+      totalDur = Math.max(totalDur, s.end);
+    }
+    return totalDur;
+  }
+
+  // Sequential.
+  const seqSeg = [];
+  let t = 0;
+  for (let k = 0; k < state.numKernels; k++) {
+    seqSeg.push({ start: t, end: t+state.launchOH, color: "rgba(231,76,60,0.7)", label: "lh" });
+    t += state.launchOH;
+    seqSeg.push({ start: t, end: t+state.kernelDur, color: "rgba(52,152,219,0.85)", label: "K"+k });
+    t += state.kernelDur;
+  }
+  const seqTotal = t;
+  drawTimeline(40, `sequential cudaLaunchKernel × ${state.numKernels}`, seqSeg);
+
+  // Graph replay.
+  const graphSeg = [];
+  graphSeg.push({ start: 0, end: state.graphOH, color: "rgba(155,89,182,0.85)", label: "graphLaunch" });
+  let gt = state.graphOH;
+  for (let k = 0; k < state.numKernels; k++) {
+    graphSeg.push({ start: gt, end: gt+state.kernelDur, color: "rgba(52,152,219,0.85)", label: "K"+k });
+    gt += state.kernelDur;
+  }
+  const graphTotal = gt;
+  drawTimeline(170, `cudaGraphLaunch (one driver call → ${state.numKernels} kernels)`, graphSeg);
+
+  // Time axis.
+  for (let tt = 0; tt <= tEnd; tt += 5) {
+    const x = padL + tt*colW;
+    svg.appendChild(vizlib.el("line", { x1: x, y1: 28, x2: x, y2: H-10, stroke: "#f0f0f0" }));
+    const t = vizlib.el("text", { x, y: 22, "font-size": 10, "text-anchor": "middle", fill: "#888" });
+    t.textContent = tt; svg.appendChild(t);
+  }
+  // Now-line.
+  const nx = padL + state.t * colW;
+  svg.appendChild(vizlib.el("line", { x1: nx, y1: 28, x2: nx, y2: H-10, stroke: "#000" }));
+
+  svgWrap.appendChild(svg);
+
+  const savings = seqTotal - graphTotal;
+  const pct = seqTotal > 0 ? (100 * savings / seqTotal).toFixed(1) : "0";
+  info.innerHTML =
+    `<b>sequential total:</b> ${seqTotal} µs &nbsp;&nbsp; ` +
+    `<b>graph replay total:</b> ${graphTotal} µs &nbsp;&nbsp; ` +
+    `<b>savings:</b> ${savings} µs (${pct} %) &nbsp;&nbsp; ` +
+    `<span style="color:#888">capture: cudaStreamBeginCapture / cudaStreamEndCapture / cudaGraphInstantiate (one-time cost; not shown).</span>`;
+}
+
+render();
+</script>
+</body>
+</html>

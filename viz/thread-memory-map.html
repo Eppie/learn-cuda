@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Thread → Memory Map (M02)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+
+const root = document.getElementById("root");
+vizlib.header(root, "Thread → memory map (M02 coalescing)",
+  "Each of 32 lanes in a warp issues one memory load. Lanes are color-coded by which 128-byte cache line " +
+  "(sector group) the address falls into — green/yellow/red shows how much of each fetched line is actually " +
+  "used. The 'bytes used / bytes fetched' stat at right is the canonical coalescing efficiency. " +
+  "Try stride=1 + scalar (perfectly coalesced), stride=8 + scalar (32 lines fetched, only 32×4 B used = 3 %), " +
+  "and AoS vs SoA for the xyz-vector case.");
+
+const ctrls = vizlib.html("div", { class: "controls" });
+root.appendChild(ctrls);
+
+const state = { stride: 1, loadBytes: 4, layout: "scalar" }; // scalar | aos | soa
+
+const sStride = vizlib.slider({
+  min: 0, max: 4, step: 1, value: 0, label: "stride",
+  format: v => String([1,2,4,8,32][v]),
+  onChange: v => { state.stride = [1,2,4,8,32][v]; render(); }
+});
+ctrls.appendChild(sStride.node);
+
+const dLoad = vizlib.dropdown({
+  label: "load width", value: "4",
+  options: [
+    { value: "4",  text: "scalar 4 B (float)" },
+    { value: "16", text: "vector 16 B (float4)" },
+  ],
+  onChange: v => { state.loadBytes = Number(v); render(); }
+});
+ctrls.appendChild(dLoad.node);
+
+const dLayout = vizlib.dropdown({
+  label: "layout", value: "scalar",
+  options: [
+    { value: "scalar", text: "scalar array (1 float / lane)" },
+    { value: "aos",    text: "AoS struct{x,y,z}[]  (12 B / elem)" },
+    { value: "soa",    text: "SoA  x[],y[],z[]      (4 B / elem in x[])" },
+  ],
+  onChange: v => { state.layout = v; render(); }
+});
+ctrls.appendChild(dLayout.node);
+
+const stats = vizlib.html("div", { class: "panel stats" });
+root.appendChild(stats);
+
+const svgWrap = vizlib.html("div", { class: "panel" });
+root.appendChild(svgWrap);
+
+root.appendChild(vizlib.legend([
+  { color: vizlib.STATUS.good,    label: "fully used line (≥75 %)" },
+  { color: vizlib.STATUS.partial, label: "partial (25–75 %)" },
+  { color: vizlib.STATUS.bad,     label: "wasted (<25 %)" },
+]));
+
+function render() {
+  // Compute per-lane address (in bytes, base=0).
+  const addrs = [];
+  for (let i = 0; i < 32; i++) {
+    let a;
+    if (state.layout === "scalar") {
+      // Each lane reads loadBytes-aligned slot at index (i*stride).
+      a = i * state.stride * state.loadBytes;
+    } else if (state.layout === "aos") {
+      // struct{float x,y,z}[]; each lane fetches .x at stride*12.
+      a = i * state.stride * 12;
+    } else { // soa
+      a = i * state.stride * 4;
+    }
+    addrs.push(a);
+  }
+
+  // Buckets: 128-byte cache lines.
+  const lineSet = new Map(); // line -> { lanes:[i...], used:bytes }
+  for (let i = 0; i < 32; i++) {
+    const start = addrs[i], end = addrs[i] + state.loadBytes - 1;
+    const ls = Math.floor(start / 128), le = Math.floor(end / 128);
+    for (let L = ls; L <= le; L++) {
+      if (!lineSet.has(L)) lineSet.set(L, { lanes: [], usedBytes: 0 });
+      const r = lineSet.get(L);
+      r.lanes.push(i);
+      const segStart = Math.max(start, L*128);
+      const segEnd   = Math.min(end,  L*128 + 127);
+      r.usedBytes += (segEnd - segStart + 1);
+    }
+  }
+  const lines = [...lineSet.entries()].sort((a,b)=>a[0]-b[0]);
+  const fetched = lines.length * 128;
+  const used = lines.reduce((s, [,r]) => s + r.usedBytes, 0);
+  const eff = fetched > 0 ? (100 * used / fetched).toFixed(1) : "—";
+
+  stats.innerHTML =
+    `<b>cache lines fetched:</b> ${lines.length} &nbsp;&nbsp; ` +
+    `<b>bytes fetched:</b> ${fetched} &nbsp;&nbsp; ` +
+    `<b>bytes used:</b> ${used} &nbsp;&nbsp; ` +
+    `<b>efficiency:</b> ${eff} %`;
+
+  // Render.
+  svgWrap.innerHTML = "";
+  const svg = vizlib.el("svg", { width: 1100, height: 360, viewBox: "0 0 1100 360" });
+
+  // Lane row at top.
+  svg.appendChild(vizlib.el("text", { x: 10, y: 22, "font-size": 13, "font-weight": "bold" }));
+  svg.lastChild.textContent = "Warp lanes (0–31), arrow → its address byte";
+  for (let i = 0; i < 32; i++) {
+    const x = 20 + i * 32;
+    const r = vizlib.el("rect", { x, y: 30, width: 28, height: 28, fill: "#ecf0f1", stroke: "#7f8c8d" });
+    svg.appendChild(r);
+    const t = vizlib.el("text", { x: x+14, y: 49, "text-anchor": "middle", "font-size": 11 });
+    t.textContent = i; svg.appendChild(t);
+  }
+
+  // Cache lines along the bottom.
+  const yBase = 130;
+  const lineW = Math.min(60, Math.max(28, 1000 / Math.max(1, lines.length)));
+  for (let li = 0; li < lines.length; li++) {
+    const [Lid, r] = lines[li];
+    const x = 20 + li * (lineW + 6);
+    const ratio = r.usedBytes / 128;
+    const fill = ratio >= 0.75 ? vizlib.STATUS.good : ratio >= 0.25 ? vizlib.STATUS.partial : vizlib.STATUS.bad;
+    const rect = vizlib.el("rect", { x, y: yBase, width: lineW, height: 50, fill, stroke: "#34495e" });
+    svg.appendChild(rect);
+    const t1 = vizlib.el("text", { x: x + lineW/2, y: yBase + 20, "text-anchor": "middle", "font-size": 11, fill: "#222" });
+    t1.textContent = "line " + Lid; svg.appendChild(t1);
+    const t2 = vizlib.el("text", { x: x + lineW/2, y: yBase + 40, "text-anchor": "middle", "font-size": 11, fill: "#222" });
+    t2.textContent = (100*ratio).toFixed(0) + "%"; svg.appendChild(t2);
+  }
+
+  // Arrows lane → its line.
+  for (let i = 0; i < 32; i++) {
+    const lx = 20 + i*32 + 14;
+    const ly = 58;
+    const lineIdx = lines.findIndex(([L]) => L === Math.floor(addrs[i] / 128));
+    if (lineIdx < 0) continue;
+    const tx = 20 + lineIdx * (lineW + 6) + lineW/2;
+    const ty = yBase;
+    const path = vizlib.el("path", {
+      d: `M${lx},${ly} L${tx},${ty}`, stroke: "#34495e", "stroke-width": "0.8", fill: "none", opacity: 0.45,
+    });
+    svg.appendChild(path);
+  }
+
+  // Address legend.
+  const expl = vizlib.el("text", { x: 10, y: 220, "font-size": 12, fill: "#444" });
+  expl.textContent = "Each block above = one 128-byte cache line. Color = fraction of bytes the warp actually used.";
+  svg.appendChild(expl);
+
+  // Per-lane address detail line (small).
+  const detail = vizlib.el("text", { x: 10, y: 250, "font-size": 11, fill: "#555" });
+  let s = "lane→addr: ";
+  for (let i = 0; i < Math.min(8, 32); i++) s += `L${i}=${addrs[i]} `;
+  s += "…";
+  detail.textContent = s;
+  svg.appendChild(detail);
+
+  svgWrap.appendChild(svg);
+}
+
+render();
+</script>
+</body>
+</html>

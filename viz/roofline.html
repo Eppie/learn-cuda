@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Roofline (M04)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+const root = document.getElementById("root");
+vizlib.header(root, "Roofline plot (M04 profiling)",
+  "Log-log plot of arithmetic intensity (FLOP/byte, x-axis) vs achievable throughput (TFLOP/s, y-axis). " +
+  "RTX 4090 caps: ~83 TF FP32 compute roof, ~1320 TF FP16 tensor-core roof, ~1008 GB/s HBM roof. " +
+  "Click anywhere to drop a kernel point and see whether it is BW-bound or compute-bound (the controlling " +
+  "roof, and the slack between the kernel and that roof, tells you where the time goes). The pre-placed " +
+  "samples show vector add (BW-bound), naive GEMM (BW-bound), tiled GEMM (compute-bound).");
+
+const ctrls = vizlib.html("div", { class: "controls" });
+root.appendChild(ctrls);
+
+const state = {
+  // RTX 4090 sm_89.
+  peakFP32: 83.0,    // TFLOP/s
+  peakTC:   1320.0,  // TFLOP/s tensor-core FP16
+  peakBW:   1008.0,  // GB/s
+  showTC: true,
+  kernels: [
+    { name: "vector add",  ai: 0.083, tflops: 0.083, color: "#e74c3c" },
+    { name: "naive GEMM",  ai: 0.5,   tflops: 0.45,  color: "#f39c12" },
+    { name: "tiled GEMM v3", ai: 50,  tflops: 35,    color: "#27ae60" },
+    { name: "WMMA GEMM",   ai: 200,   tflops: 850,   color: "#2980b9" },
+    { name: "softmax",     ai: 1.0,   tflops: 0.9,   color: "#8e44ad" },
+  ],
+};
+
+ctrls.appendChild(vizlib.dropdown({
+  label: "compute roof", value: "fp32",
+  options: [
+    { value: "fp32", text: "FP32 (CUDA cores) — 83 TF" },
+    { value: "tc",   text: "FP16 (tensor cores) — 1320 TF" },
+    { value: "both", text: "show both" },
+  ],
+  onChange: v => { state.show = v; render(); }
+}).node);
+state.show = "both";
+
+ctrls.appendChild(vizlib.button("clear my kernels", () => {
+  state.kernels = state.kernels.slice(0,5);
+  render();
+}));
+
+const info = vizlib.html("div", { class: "panel stats" });
+root.appendChild(info);
+const plot = vizlib.html("div", { class: "panel" });
+root.appendChild(plot);
+
+const xMin=0.01, xMax=1000, yMin=0.01, yMax=2000; // log-scale ranges in TFLOP/s and FLOP/byte
+
+function log10(x){ return Math.log(x)/Math.LN10; }
+function xToPx(ai, W, padL, padR) { return padL + (log10(ai)-log10(xMin)) / (log10(xMax)-log10(xMin)) * (W-padL-padR); }
+function yToPx(t,  H, padT, padB) { return H-padB - (log10(t) -log10(yMin)) / (log10(yMax)-log10(yMin)) * (H-padT-padB); }
+function pxToX(px, W, padL, padR) {
+  const f = (px - padL) / (W-padL-padR);
+  return Math.pow(10, log10(xMin) + f*(log10(xMax)-log10(xMin)));
+}
+function pxToY(py, H, padT, padB) {
+  const f = (H-padB - py) / (H-padT-padB);
+  return Math.pow(10, log10(yMin) + f*(log10(yMax)-log10(yMin)));
+}
+
+function classify(ai, tf) {
+  // Pick effective compute roof.
+  const cRoof = state.show === "fp32" ? state.peakFP32 :
+                state.show === "tc"   ? state.peakTC   :
+                Math.max(state.peakFP32, state.peakTC);
+  const bwRoof = ai * (state.peakBW / 1000.0); // GB/s → TF; FLOP/byte * GB/s = GFLOP/s = TF/1000
+  // ai * BW is in GFLOP/s; convert: ai (FLOP/byte) × BW (B/s) = FLOP/s. With BW in GB/s, that gives GFLOP/s.
+  const bwRoofTF = ai * state.peakBW / 1000.0;
+  const ridge = cRoof / state.peakBW * 1000.0; // AI at which compute = BW roof
+  let bound;
+  if (ai < ridge) bound = "BW-bound";
+  else            bound = "compute-bound";
+  const ceiling = Math.min(cRoof, bwRoofTF);
+  const eff = (tf / ceiling * 100).toFixed(1);
+  return { bound, ceiling, eff, ridge };
+}
+
+function render() {
+  plot.innerHTML = "";
+  const W=900, H=520, padL=70, padR=20, padT=20, padB=60;
+  const svg = vizlib.el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+
+  // Background.
+  svg.appendChild(vizlib.el("rect", { x: padL, y: padT, width: W-padL-padR, height: H-padT-padB,
+    fill: "#fdfdfd", stroke: "#bbb" }));
+
+  // Gridlines (decades).
+  for (let xd = -2; xd <= 3; xd++) {
+    const ai = Math.pow(10, xd);
+    const X = xToPx(ai, W, padL, padR);
+    svg.appendChild(vizlib.el("line", { x1: X, y1: padT, x2: X, y2: H-padB, stroke: "#eee" }));
+    const t = vizlib.el("text", { x: X, y: H-padB+15, "font-size": 11, "text-anchor": "middle" });
+    t.textContent = `10^${xd}`; svg.appendChild(t);
+  }
+  for (let yd = -2; yd <= 3; yd++) {
+    const tf = Math.pow(10, yd);
+    const Y = yToPx(tf, H, padT, padB);
+    svg.appendChild(vizlib.el("line", { x1: padL, y1: Y, x2: W-padR, y2: Y, stroke: "#eee" }));
+    const t = vizlib.el("text", { x: padL-6, y: Y+3, "font-size": 11, "text-anchor": "end" });
+    t.textContent = `10^${yd}`; svg.appendChild(t);
+  }
+
+  // Axis labels.
+  const xa = vizlib.el("text", { x: (padL+W-padR)/2, y: H-padB+38, "font-size": 13, "text-anchor": "middle" });
+  xa.textContent = "Arithmetic intensity (FLOP / byte)"; svg.appendChild(xa);
+  const ya = vizlib.el("text", { x: 16, y: (padT+H-padB)/2, "font-size": 13, "text-anchor": "middle",
+    transform: `rotate(-90 16 ${(padT+H-padB)/2})` });
+  ya.textContent = "Throughput (TFLOP/s)"; svg.appendChild(ya);
+
+  // BW roof: y = ai * BW (clipped to compute roof).
+  function drawRoof(cRoof, color, label) {
+    const ridge = cRoof / state.peakBW * 1000.0;
+    // BW segment from xMin to ridge
+    const x1 = xToPx(xMin, W, padL, padR), y1 = yToPx(xMin*state.peakBW/1000.0, H, padT, padB);
+    const x2 = xToPx(ridge, W, padL, padR), y2 = yToPx(cRoof, H, padT, padB);
+    const x3 = xToPx(xMax, W, padL, padR), y3 = yToPx(cRoof, H, padT, padB);
+    svg.appendChild(vizlib.el("line", { x1, y1, x2, y2, stroke: color, "stroke-width": 2 }));
+    svg.appendChild(vizlib.el("line", { x1: x2, y1: y2, x2: x3, y2: y3, stroke: color, "stroke-width": 2 }));
+    const t = vizlib.el("text", { x: x3-4, y: y3-6, "font-size": 11, "text-anchor": "end", fill: color });
+    t.textContent = label; svg.appendChild(t);
+  }
+  if (state.show === "fp32" || state.show === "both") drawRoof(state.peakFP32, "#3498db", `FP32 ${state.peakFP32} TF`);
+  if (state.show === "tc"   || state.show === "both") drawRoof(state.peakTC,   "#9b59b6", `Tensor ${state.peakTC} TF`);
+
+  // BW label
+  const bwT = vizlib.el("text", { x: padL+10, y: padT+15, "font-size": 11, fill: "#555" });
+  bwT.textContent = `BW roof: ${state.peakBW} GB/s`; svg.appendChild(bwT);
+
+  // Kernel points.
+  for (const k of state.kernels) {
+    const cx = xToPx(k.ai, W, padL, padR), cy = yToPx(k.tflops, H, padT, padB);
+    svg.appendChild(vizlib.el("circle", { cx, cy, r: 6, fill: k.color, stroke: "#222", "stroke-width": 1 }));
+    const t = vizlib.el("text", { x: cx+9, y: cy+4, "font-size": 11, fill: "#222" });
+    t.textContent = k.name; svg.appendChild(t);
+  }
+
+  plot.appendChild(svg);
+
+  // Click handler — add a kernel.
+  svg.addEventListener("click", (ev) => {
+    const r = svg.getBoundingClientRect();
+    const px = (ev.clientX - r.left) * (W / r.width);
+    const py = (ev.clientY - r.top)  * (H / r.height);
+    if (px < padL || px > W-padR || py < padT || py > H-padB) return;
+    const ai = pxToX(px, W, padL, padR);
+    const tf = pxToY(py, H, padT, padB);
+    const c = classify(ai, tf);
+    state.kernels.push({ name: `(${ai.toFixed(2)}, ${tf.toFixed(2)})`, ai, tflops: tf, color: "#16a085" });
+    info.innerHTML = `Placed kernel @ AI=<b>${ai.toFixed(2)}</b> FLOP/B, throughput=<b>${tf.toFixed(2)}</b> TF.<br>` +
+      `Regime: <b>${c.bound}</b> (ridge AI = ${c.ridge.toFixed(1)}). ` +
+      `Ceiling under that roof = <b>${c.ceiling.toFixed(2)}</b> TF; you reach <b>${c.eff} %</b> of it. ` +
+      (c.bound === "BW-bound"
+        ? "Stall reason: waiting on memory. Improve coalescing, raise reuse (tile/share), or move to a higher-AI algorithm."
+        : "Stall reason: ALUs/tensor cores fully fed. Improve via mixed precision, occupancy tweaks, or reducing redundant work.");
+    render();
+  });
+
+  if (!info.innerHTML) info.textContent = "Click anywhere on the plot to add a kernel point and see its bound regime.";
+}
+
+render();
+</script>
+</body>
+</html>

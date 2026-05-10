@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Online softmax (M09 / M10)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+const root = document.getElementById("root");
+vizlib.header(root, "Online softmax recurrence (M09 → M10 FlashAttention)",
+  "Naïve softmax(x) = exp(x_i - max(x)) / sum(exp(x_j - max(x))) needs two passes. The online form keeps " +
+  "a running pair (m, s) and updates it as elements arrive. When a new element x_i exceeds the current m, " +
+  "the running sum is rescaled by exp(m_old - m_new). Watch for the rescale flash when the max is " +
+  "overtaken — that single trick is what lets FlashAttention stream K/V tiles without materializing the " +
+  "full S=QKᵀ.");
+
+const ctrls = vizlib.html("div", { class: "controls" });
+root.appendChild(ctrls);
+
+const state = { i: 0, vals: [], speed: 600, playing: false };
+
+function regen() {
+  const N = 12;
+  state.vals = Array.from({length: N}, () => +(Math.random()*6 - 1).toFixed(2));
+  state.i = 0;
+  render();
+}
+ctrls.appendChild(vizlib.button("regenerate", () => regen()));
+ctrls.appendChild(vizlib.button("◀ rewind", () => { state.i = 0; render(); }));
+ctrls.appendChild(vizlib.button("step ▶", () => { stepOne(); }));
+const playBtn = vizlib.button("play", () => togglePlay());
+ctrls.appendChild(playBtn);
+
+const info = vizlib.html("div", { class: "panel stats" });
+root.appendChild(info);
+const svgWrap = vizlib.html("div", { class: "panel" });
+root.appendChild(svgWrap);
+
+function stepOne() {
+  if (state.i >= state.vals.length) return;
+  state.i++;
+  render();
+}
+function togglePlay() {
+  state.playing = !state.playing;
+  playBtn.textContent = state.playing ? "pause" : "play";
+  if (state.playing) tick();
+}
+function tick() {
+  if (!state.playing) return;
+  if (state.i >= state.vals.length) { state.playing = false; playBtn.textContent = "play"; return; }
+  stepOne();
+  setTimeout(tick, state.speed);
+}
+
+function recurrence() {
+  // Walk through state.i steps. Return per-step events.
+  let m = -Infinity, s = 0;
+  const events = [];
+  let rescaledThisStep = false;
+  for (let i = 0; i < state.i; i++) {
+    const x = state.vals[i];
+    rescaledThisStep = false;
+    let factor = 1;
+    if (x > m) {
+      const mOld = m;
+      const mNew = x;
+      const f = Math.exp(mOld === -Infinity ? -1e9 : (mOld - mNew));
+      factor = f;
+      s = (mOld === -Infinity ? 0 : s * f) + 1;
+      m = mNew;
+      rescaledThisStep = (i > 0);
+    } else {
+      s += Math.exp(x - m);
+    }
+    events.push({ x, m, s, rescaled: rescaledThisStep, factor });
+  }
+  return events;
+}
+
+function render() {
+  const N = state.vals.length;
+  const ev = recurrence();
+  const m = ev.length ? ev[ev.length-1].m : null;
+  const s = ev.length ? ev[ev.length-1].s : 0;
+
+  svgWrap.innerHTML = "";
+  const W = 1100, H = 360;
+  const svg = vizlib.el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+
+  // Stream of values.
+  const padL = 30, padT = 30;
+  const cellW = 60, cellH = 50;
+  for (let i = 0; i < N; i++) {
+    const x = padL + i*cellW, y = padT;
+    const isProcessed = i < state.i;
+    const wasRescale = isProcessed && ev[i].rescaled;
+    svg.appendChild(vizlib.el("rect", { x, y, width: cellW-4, height: cellH,
+      fill: isProcessed ? (wasRescale ? "#fdebd0" : "#d6eaf8") : "#f4f6f6",
+      stroke: wasRescale ? "#e67e22" : "#7f8c8d", "stroke-width": wasRescale ? 2 : 1 }));
+    const t = vizlib.el("text", { x: x+(cellW-4)/2, y: y+30, "text-anchor": "middle", "font-size": 13 });
+    t.textContent = state.vals[i].toFixed(2); svg.appendChild(t);
+    const idx = vizlib.el("text", { x: x+(cellW-4)/2, y: y+12, "text-anchor": "middle", "font-size": 9, fill: "#777" });
+    idx.textContent = "x_" + i; svg.appendChild(idx);
+  }
+
+  // Cursor.
+  if (state.i < N) {
+    const cx = padL + state.i*cellW;
+    svg.appendChild(vizlib.el("line", { x1: cx-2, y1: padT-6, x2: cx-2, y2: padT+cellH+6,
+      stroke: "#000", "stroke-width": 2 }));
+  }
+
+  // (m, s) display.
+  const mY = padT + cellH + 50;
+  const mT = vizlib.el("text", { x: padL, y: mY, "font-size": 16, "font-weight": "bold" });
+  mT.textContent = `m = ${m === null || m === -Infinity ? "—" : m.toFixed(3)}    s = ${ev.length ? s.toFixed(3) : "—"}`;
+  svg.appendChild(mT);
+
+  // Per-step trace.
+  const tY = mY + 30;
+  const traceLabel = vizlib.el("text", { x: padL, y: tY, "font-size": 12, "font-weight": "bold" });
+  traceLabel.textContent = "Steps:"; svg.appendChild(traceLabel);
+  for (let i = 0; i < ev.length; i++) {
+    const e = ev[i];
+    const yy = tY + 22 + i*16;
+    if (yy > H-10) break;
+    const text = e.rescaled
+      ? `i=${i}: x=${e.x.toFixed(2)} > m_old → rescale s by exp(m_old−m_new)=${e.factor.toExponential(2)}, then m=${e.m.toFixed(3)}, s=${e.s.toFixed(3)}`
+      : `i=${i}: x=${e.x.toFixed(2)} ≤ m → s += exp(x−m), m=${e.m.toFixed(3)}, s=${e.s.toFixed(3)}`;
+    const tt = vizlib.el("text", { x: padL, y: yy, "font-size": 11,
+      fill: e.rescaled ? "#d35400" : "#222" });
+    tt.textContent = text; svg.appendChild(tt);
+  }
+
+  svgWrap.appendChild(svg);
+
+  // Compare to true (m*, s*).
+  if (state.i === N && N > 0) {
+    let mStar = -Infinity; for (const v of state.vals) if (v > mStar) mStar = v;
+    let sStar = 0; for (const v of state.vals) sStar += Math.exp(v - mStar);
+    info.innerHTML =
+      `<b>final online (m, s) = (${m.toFixed(3)}, ${s.toFixed(3)})</b><br>` +
+      `<b>two-pass reference (m*, s*) = (${mStar.toFixed(3)}, ${sStar.toFixed(3)})</b> ` +
+      ` → softmax(x_i) = exp(x_i − m) / s ≈ exp(x_i − m*) / s* ✓`;
+  } else {
+    info.innerHTML = `Step through to see the recurrence; orange flash marks a rescale step (new max overtakes old).`;
+  }
+}
+
+regen();
+</script>
+</body>
+</html>

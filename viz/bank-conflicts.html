@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Shared-Memory Bank Conflicts (M03)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+
+const root = document.getElementById("root");
+vizlib.header(root, "Shared-memory bank conflicts (M03)",
+  "Shared memory has 32 banks of 4 bytes each, interleaved. The cell at row r, col c of a tile of stride S " +
+  "lives in bank ((r*S + c) * (loadBytes/4)) % 32. The classic conflict: 32×32 float tile, lane k reads " +
+  "column k → all lanes hit bank 0. Padding to stride 33 (or applying an XOR-swizzle) restores 32-way " +
+  "parallelism. Toggle the access width (8 B → broadcasts to 2 banks/lane; 16 B → 4 banks/lane).");
+
+const ctrls = vizlib.html("div", { class: "controls" });
+root.appendChild(ctrls);
+const state = { layout: "32x32", access: 4, pattern: "col" };
+
+ctrls.appendChild(vizlib.dropdown({
+  label: "tile layout", value: "32x32",
+  options: [
+    { value: "32x32",   text: "32×32 (stride 32, conflicts)" },
+    { value: "32x33",   text: "32×33 (+1 pad, no conflicts)" },
+    { value: "swizzle", text: "32×32 XOR-swizzle (no conflicts)" },
+  ],
+  onChange: v => { state.layout = v; render(); }
+}).node);
+
+ctrls.appendChild(vizlib.dropdown({
+  label: "access width", value: "4",
+  options: [
+    { value: "4",  text: "4-byte (float)"  },
+    { value: "8",  text: "8-byte (float2)" },
+    { value: "16", text: "16-byte (float4)"},
+  ],
+  onChange: v => { state.access = Number(v); render(); }
+}).node);
+
+ctrls.appendChild(vizlib.dropdown({
+  label: "warp pattern", value: "col",
+  options: [
+    { value: "col", text: "lane i reads column i (transpose)" },
+    { value: "row", text: "lane i reads row i (load)" },
+    { value: "diag",text: "lane i reads (i, i)" },
+  ],
+  onChange: v => { state.pattern = v; render(); }
+}).node);
+
+const stats = vizlib.html("div", { class: "panel stats" });
+root.appendChild(stats);
+const tilePanel = vizlib.html("div", { class: "panel" });
+root.appendChild(tilePanel);
+
+function bankOf(r, c) {
+  // Word index, then mod 32.
+  let stride;
+  if (state.layout === "32x32")   stride = 32;
+  else if (state.layout === "32x33") stride = 33;
+  else stride = 32; // swizzle
+  let word = r * stride + c;
+  if (state.layout === "swizzle") {
+    // XOR-swizzle: c' = c ^ (r % 32). Common pattern.
+    word = r * stride + (c ^ (r & 31));
+  }
+  return word % 32;
+}
+
+function render() {
+  // Render tile grid.
+  tilePanel.innerHTML = "";
+  const cols = state.layout === "32x33" ? 33 : 32;
+  const rows = 32;
+  const cell = 18;
+  const w = cols*cell + 80, h = rows*cell + 60;
+  const svg = vizlib.el("svg", { width: w, height: h, viewBox: `0 0 ${w} ${h}` });
+
+  // Header
+  const hdr = vizlib.el("text", { x: 10, y: 18, "font-size": 12, "font-weight": "bold" });
+  hdr.textContent = "Tile cells colored by bank (0–31). Highlighted cells = warp's 32 accesses.";
+  svg.appendChild(hdr);
+
+  // Determine which (r,c) the 32 lanes touch.
+  const accesses = [];
+  for (let lane = 0; lane < 32; lane++) {
+    let r,c;
+    if (state.pattern === "col")  { r = lane; c = 0; /* later: column k -> all lanes col=k */ }
+    if (state.pattern === "row")  { r = 0;    c = lane; }
+    if (state.pattern === "diag") { r = lane; c = lane; }
+    if (state.pattern === "col")  { r = lane; c = 0; }
+    accesses.push({ lane, r, c });
+  }
+  // Re-issue: "lane i reads column k" — pick a fixed k so all lanes target column 0; that is the
+  // canonical bank-0-conflict. For "row" all lanes go to row 0, conflict only on stride/access width.
+  // Compute banks touched per access.
+  const bankHits = new Array(32).fill(0);
+  for (const a of accesses) {
+    // Each access of `access` bytes starts at word (r*stride+c) and may span access/4 banks.
+    let stride = state.layout === "32x33" ? 33 : 32;
+    let word = a.r * stride + a.c;
+    if (state.layout === "swizzle") word = a.r * stride + (a.c ^ (a.r & 31));
+    const numBanks = state.access / 4;
+    for (let b = 0; b < numBanks; b++) bankHits[(word + b) % 32]++;
+  }
+  // Conflict factor = max bankHits / numBanks (1 = no conflict, >1 = serialized).
+  const numBanks = state.access / 4;
+  const totalAccesses = 32 * numBanks;
+  let maxHit = 0; for (const h of bankHits) if (h > maxHit) maxHit = h;
+  const cf = maxHit; // hits to busiest bank
+  const ways = cf; // ways serialized
+
+  // Render cells.
+  const accessSet = new Set(accesses.map(a => a.r + "," + a.c));
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const x = 30 + c*cell, y = 30 + r*cell;
+      const bk = bankOf(r, c);
+      const fill = vizlib.BANK_PALETTE[bk];
+      const isHit = accessSet.has(r + "," + c);
+      svg.appendChild(vizlib.el("rect", {
+        x, y, width: cell-1, height: cell-1, fill,
+        stroke: isHit ? "#000" : "#999",
+        "stroke-width": isHit ? 2 : 0.4,
+      }));
+    }
+  }
+
+  // Row/col tick numbers (sparse).
+  for (let i = 0; i < cols; i += 4) {
+    const t = vizlib.el("text", { x: 30+i*cell+cell/2, y: 28, "font-size": 9, "text-anchor": "middle", fill: "#555" });
+    t.textContent = i; svg.appendChild(t);
+  }
+  for (let i = 0; i < rows; i += 4) {
+    const t = vizlib.el("text", { x: 22, y: 30+i*cell+cell-3, "font-size": 9, "text-anchor": "end", fill: "#555" });
+    t.textContent = i; svg.appendChild(t);
+  }
+
+  tilePanel.appendChild(svg);
+
+  // Bank histogram.
+  const histSvg = vizlib.el("svg", { width: 1080, height: 110, viewBox: "0 0 1080 110" });
+  const ht = vizlib.el("text", { x: 10, y: 16, "font-size": 12, "font-weight": "bold" });
+  ht.textContent = "Hits per bank for the warp's 32 accesses (×" + numBanks + " per lane for " + state.access + "-byte access)";
+  histSvg.appendChild(ht);
+  for (let b = 0; b < 32; b++) {
+    const x = 30 + b*32;
+    const bh = bankHits[b];
+    const barH = bh * 12;
+    histSvg.appendChild(vizlib.el("rect", { x, y: 90 - barH, width: 26, height: Math.max(1, barH),
+      fill: vizlib.BANK_PALETTE[b], stroke: "#444" }));
+    const t = vizlib.el("text", { x: x+13, y: 105, "font-size": 9, "text-anchor": "middle" });
+    t.textContent = b; histSvg.appendChild(t);
+    if (bh > 0) {
+      const t2 = vizlib.el("text", { x: x+13, y: 88-barH, "font-size": 10, "text-anchor": "middle", fill: "#222" });
+      t2.textContent = bh; histSvg.appendChild(t2);
+    }
+  }
+  tilePanel.appendChild(histSvg);
+
+  stats.innerHTML =
+    `<b>access width:</b> ${state.access} B (${numBanks} bank(s) per lane) &nbsp;&nbsp; ` +
+    `<b>busiest bank hit:</b> ${maxHit} &nbsp;&nbsp; ` +
+    `<b>serialization:</b> ${ways}-way ${ways===1 ? "(no conflict, single transaction)" : "(this many cycles to satisfy the warp)"}`;
+}
+
+render();
+</script>
+</body>
+</html>

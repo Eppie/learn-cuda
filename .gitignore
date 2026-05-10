@@ -1,0 +1,46 @@
+# Module binaries (no extension; same names as their source .cu files
+# without the extension, so we list them explicitly to avoid shadowing
+# the source files in the source tree).
+solution
+starter
+bench
+scan_solution
+scan_starter
+scan_bench
+solution_mb
+starter_mb
+events_demo
+persistent_demo
+ring_buffer
+inference_pipeline
+vector_add
+cache_hints
+cpasync_inline
+mma_sync_example
+ldmatrix_example
+clock_microbench
+bar_sync_example
+
+# CUDA build artifacts
+*.o
+*.obj
+*.cubin
+*.dwo
+
+# Note: *.ptx and *.sass under 13-ptx-appendix/ are deliberately committed
+# as reading material. Do not add them to .gitignore.
+
+# Profiler artifacts
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.qdstrm
+*.sqlite
+
+# Editor / OS / tooling
+*~
+.DS_Store
+.vscode/
+.idea/
+.cache/
+.claude/

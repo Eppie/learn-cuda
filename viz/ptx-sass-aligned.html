@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PTX ↔ SASS alignment (M13)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+const root = document.getElementById("root");
+vizlib.header(root, "PTX ↔ SASS alignment (M13)",
+  "Side-by-side view of a small kernel's PTX (left, virtual ISA — what nvcc emits) and SASS (right, " +
+  "real machine code for sm_89 — what runs). Hover a line on either side to highlight its counterpart. " +
+  "Common transformations the assembler does: ld.global.nc → LDG.E.CONSTANT, mad.lo.u32 → IMAD, " +
+  "fma.rn.f32 → FFMA, predicates fused into instructions, loads hoisted earlier. The example is a " +
+  "saxpy-style inner body: y[i] = a*x[i] + y[i].");
+
+const panel = vizlib.html("div", { class: "panel" });
+root.appendChild(panel);
+
+// Hand-crafted illustrative pair. Real PTX/SASS pairs live in 13-ptx-appendix; this is a teaching aid.
+const pairs = [
+  {
+    ptx:  "ld.param.u64    %rd1, [saxpy_param_0];   // float a (in param)",
+    sass: "MOV R0, c[0x0][0x160] ;",
+    note: "param load → constant-bank read"
+  },
+  {
+    ptx:  "ld.param.u64    %rd2, [saxpy_param_1];   // float* x",
+    sass: "MOV R2, c[0x0][0x168] ;",
+    note: "param → const bank"
+  },
+  {
+    ptx:  "ld.param.u64    %rd3, [saxpy_param_2];   // float* y",
+    sass: "MOV R3, c[0x0][0x170] ;",
+    note: "param → const bank"
+  },
+  {
+    ptx:  "cvta.to.global.u64  %rd4, %rd2;",
+    sass: "(implicit; SASS uses generic→global cast inline)",
+    note: "no separate SASS instruction; absorbed into LDG"
+  },
+  {
+    ptx:  "mov.u32         %r1, %ctaid.x;",
+    sass: "S2R R4, SR_CTAID.X ;",
+    note: "special-register read"
+  },
+  {
+    ptx:  "mov.u32         %r2, %ntid.x;",
+    sass: "S2R R5, SR_NTID.X ;",
+    note: "special-register read"
+  },
+  {
+    ptx:  "mov.u32         %r3, %tid.x;",
+    sass: "S2R R6, SR_TID.X ;",
+    note: "special-register read"
+  },
+  {
+    ptx:  "mad.lo.s32      %r4, %r1, %r2, %r3;     // i = ctaid*ntid + tid",
+    sass: "IMAD R7, R4, R5, R6 ;",
+    note: "mad.lo → IMAD (single fused instruction)"
+  },
+  {
+    ptx:  "mul.wide.s32    %rd5, %r4, 4;            // byte offset = i * sizeof(float)",
+    sass: "(absorbed into LDG addressing mode)",
+    note: "scaled load – nvcc folds *4 into the LDG"
+  },
+  {
+    ptx:  "add.s64         %rd6, %rd4, %rd5;        // &x[i]",
+    sass: "(absorbed)",
+    note: "address arithmetic folded into LDG"
+  },
+  {
+    ptx:  "ld.global.nc.f32  %f1, [%rd6];           // load x[i] via read-only cache",
+    sass: "LDG.E.CONSTANT.SYS R8, [R2.64+R7.X4] ;",
+    note: ".nc (read-only) → CONSTANT cache hint"
+  },
+  {
+    ptx:  "ld.global.f32   %f2, [%rd7];             // load y[i]",
+    sass: "LDG.E.SYS R9, [R3.64+R7.X4] ;",
+    note: "regular global load"
+  },
+  {
+    ptx:  "fma.rn.f32      %f3, %f1, %fa, %f2;      // a*x[i] + y[i]",
+    sass: "FFMA R10, R8, R0, R9 ;",
+    note: "fma.rn.f32 → FFMA (single FMA)"
+  },
+  {
+    ptx:  "st.global.f32   [%rd7], %f3;             // y[i] = result",
+    sass: "STG.E.SYS [R3.64+R7.X4], R10 ;",
+    note: "store"
+  },
+  {
+    ptx:  "ret;",
+    sass: "EXIT ;",
+    note: "kernel exit"
+  },
+];
+
+// Build two-column UI.
+const wrap = vizlib.html("div");
+wrap.style.display = "grid";
+wrap.style.gridTemplateColumns = "1fr 1fr";
+wrap.style.gap = "12px";
+panel.appendChild(wrap);
+
+const ptxCol = vizlib.html("div");
+const sassCol = vizlib.html("div");
+wrap.appendChild(ptxCol);
+wrap.appendChild(sassCol);
+
+ptxCol.appendChild(vizlib.html("h3", null, "PTX (virtual)"));
+sassCol.appendChild(vizlib.html("h3", null, "SASS (sm_89)"));
+
+const ptxBox = vizlib.html("pre");
+ptxBox.style.cssText = "background:#272822;color:#f8f8f2;padding:10px;border-radius:4px;overflow:auto;font-size:12px;line-height:1.5;";
+const sassBox = vizlib.html("pre");
+sassBox.style.cssText = ptxBox.style.cssText;
+
+ptxCol.appendChild(ptxBox);
+sassCol.appendChild(sassBox);
+
+const note = vizlib.html("div", { class: "panel stats" });
+note.innerHTML = "<i>Hover a line on either side to highlight the counterpart.</i>";
+root.appendChild(note);
+
+for (let i = 0; i < pairs.length; i++) {
+  const lp = vizlib.html("span", { "data-pair": String(i) });
+  lp.textContent = pairs[i].ptx + "\n";
+  lp.style.cursor = "default";
+  ptxBox.appendChild(lp);
+
+  const ls = vizlib.html("span", { "data-pair": String(i) });
+  ls.textContent = pairs[i].sass + "\n";
+  ls.style.cursor = "default";
+  sassBox.appendChild(ls);
+}
+
+function setHL(idx, on) {
+  const sel = `[data-pair="${idx}"]`;
+  for (const e of document.querySelectorAll(sel)) {
+    e.style.background = on ? "#a6e22e44" : "transparent";
+    e.style.color = on ? "#fff" : "#f8f8f2";
+  }
+  if (on) {
+    note.innerHTML = `<b>line ${idx}:</b> ${pairs[idx].note}`;
+  } else if (idx === currentHL) {
+    note.innerHTML = "<i>Hover a line on either side to highlight the counterpart.</i>";
+  }
+}
+let currentHL = -1;
+ptxBox.addEventListener("mouseover", (e) => {
+  const t = e.target.closest("[data-pair]"); if (!t) return;
+  const i = +t.getAttribute("data-pair");
+  if (currentHL >= 0) setHL(currentHL, false);
+  currentHL = i; setHL(i, true);
+});
+sassBox.addEventListener("mouseover", (e) => {
+  const t = e.target.closest("[data-pair]"); if (!t) return;
+  const i = +t.getAttribute("data-pair");
+  if (currentHL >= 0) setHL(currentHL, false);
+  currentHL = i; setHL(i, true);
+});
+ptxBox.addEventListener("mouseleave", () => { if (currentHL >= 0) { setHL(currentHL, false); currentHL = -1; } });
+sassBox.addEventListener("mouseleave", () => { if (currentHL >= 0) { setHL(currentHL, false); currentHL = -1; } });
+</script>
+</body>
+</html>

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Warp Shuffle Butterfly (M05)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+const root = document.getElementById("root");
+vizlib.header(root, "Warp shuffle butterfly (M05 reductions)",
+  "A canonical warp-wide reduction: 5 rounds of __shfl_down_sync with offsets 16, 8, 4, 2, 1. " +
+  "After round k, lane i holds the sum of lanes [i .. min(i+offset, 31)] from before. After 5 rounds, " +
+  "lane 0 holds the full sum. Press play to step through; rewind to start over. Lane labels show the " +
+  "current value (initial values: lane i holds i).");
+
+const ctrls = vizlib.html("div", { class: "controls" });
+root.appendChild(ctrls);
+
+const state = { round: 0, vals: Array.from({length:32}, (_,i)=>i), playing: false, mode: "down" };
+
+ctrls.appendChild(vizlib.dropdown({
+  label: "shuffle type", value: "down",
+  options: [
+    { value: "down",  text: "__shfl_down_sync (offsets 16,8,4,2,1)" },
+    { value: "xor",   text: "__shfl_xor_sync (laneMask 16,8,4,2,1)" },
+  ],
+  onChange: v => { state.mode = v; reset(); }
+}).node);
+
+ctrls.appendChild(vizlib.button("◀ rewind", () => { reset(); }));
+ctrls.appendChild(vizlib.button("step ▶", () => { step(); }));
+const playBtn = vizlib.button("play", () => { togglePlay(); });
+ctrls.appendChild(playBtn);
+
+const info = vizlib.html("div", { class: "panel stats" });
+root.appendChild(info);
+const svgWrap = vizlib.html("div", { class: "panel" });
+root.appendChild(svgWrap);
+
+function offsets() { return [16, 8, 4, 2, 1]; }
+
+function reset() {
+  state.round = 0;
+  state.vals = Array.from({length:32}, (_,i)=>i);
+  state.playing = false;
+  playBtn.textContent = "play";
+  render();
+}
+
+function step() {
+  if (state.round >= 5) return;
+  const off = offsets()[state.round];
+  const next = state.vals.slice();
+  for (let i = 0; i < 32; i++) {
+    let src;
+    if (state.mode === "down") src = i + off;
+    else                       src = i ^ off;
+    if (src < 32 && src >= 0) next[i] = state.vals[i] + state.vals[src];
+    else next[i] = state.vals[i]; // shfl_down past end keeps own value
+  }
+  state.vals = next;
+  state.round++;
+  render();
+  if (state.round >= 5) {
+    state.playing = false;
+    playBtn.textContent = "play";
+  }
+}
+
+function togglePlay() {
+  state.playing = !state.playing;
+  playBtn.textContent = state.playing ? "pause" : "play";
+  if (state.playing) tick();
+}
+function tick() {
+  if (!state.playing) return;
+  if (state.round >= 5) { state.playing = false; playBtn.textContent = "play"; return; }
+  step();
+  setTimeout(tick, 850);
+}
+
+function render() {
+  svgWrap.innerHTML = "";
+  const W = 1100, H = 320;
+  const svg = vizlib.el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+  const xL = i => 30 + i * 33;
+  const yTop = 60, yBot = 230;
+
+  // Header
+  const t = vizlib.el("text", { x: 10, y: 22, "font-size": 13, "font-weight": "bold" });
+  t.textContent = `Round ${state.round}/5` + (state.round < 5 ? `  →  next: offset ${offsets()[state.round]}` : "  →  reduction complete");
+  svg.appendChild(t);
+
+  // Top row (before this round) and bottom row (after) — animate by drawing arrows for the *next* op.
+  for (let i = 0; i < 32; i++) {
+    // top
+    svg.appendChild(vizlib.el("rect", { x: xL(i), y: yTop, width: 28, height: 32, fill: "#ecf0f1", stroke: "#7f8c8d" }));
+    const lab = vizlib.el("text", { x: xL(i)+14, y: yTop+20, "text-anchor": "middle", "font-size": 11 });
+    lab.textContent = state.vals[i]; svg.appendChild(lab);
+    const il = vizlib.el("text", { x: xL(i)+14, y: yTop-4, "text-anchor": "middle", "font-size": 9, fill: "#777" });
+    il.textContent = i; svg.appendChild(il);
+  }
+
+  // If we're at round k < 5, draw arrows from lane i to lane i (after combining with src).
+  if (state.round < 5) {
+    const off = offsets()[state.round];
+    for (let i = 0; i < 32; i++) {
+      let src;
+      if (state.mode === "down") src = i + off;
+      else                       src = i ^ off;
+      if (src >= 32 || src < 0) continue;
+      const x1 = xL(src) + 14, y1 = yTop + 32;
+      const x2 = xL(i) + 14, y2 = yBot;
+      const path = vizlib.el("path", {
+        d: `M${x1},${y1} C${x1},${(y1+y2)/2} ${x2},${(y1+y2)/2} ${x2},${y2}`,
+        stroke: vizlib.STATUS.accentA, "stroke-width": "1.2", fill: "none", opacity: 0.7,
+      });
+      svg.appendChild(path);
+      // Marker arrowhead manually
+      svg.appendChild(vizlib.el("polygon", {
+        points: `${x2-3},${y2-6} ${x2+3},${y2-6} ${x2},${y2}`,
+        fill: vizlib.STATUS.accentA,
+      }));
+    }
+  }
+
+  // Bottom row (post-round), only after stepping.
+  for (let i = 0; i < 32; i++) {
+    svg.appendChild(vizlib.el("rect", { x: xL(i), y: yBot, width: 28, height: 32,
+      fill: state.round===0 ? "#fff" : "#fef9e7", stroke: "#7f8c8d" }));
+    if (state.round > 0) {
+      const lab = vizlib.el("text", { x: xL(i)+14, y: yBot+20, "text-anchor": "middle", "font-size": 11 });
+      lab.textContent = state.vals[i]; svg.appendChild(lab);
+    }
+  }
+
+  // Labels.
+  const tl = vizlib.el("text", { x: 10, y: yTop+18, "font-size": 11, fill: "#444" });
+  tl.textContent = "before"; svg.appendChild(tl);
+  const tb = vizlib.el("text", { x: 10, y: yBot+18, "font-size": 11, fill: "#444" });
+  tb.textContent = "after";  svg.appendChild(tb);
+
+  svgWrap.appendChild(svg);
+
+  info.innerHTML = `<b>lane 0 value:</b> ${state.vals[0]}` +
+    (state.round===5 ? ` &nbsp;&nbsp; (sum of 0..31 = 496 ✓)` : ` &nbsp;&nbsp; (target after 5 rounds: 496)`);
+}
+
+render();
+</script>
+</body>
+</html>

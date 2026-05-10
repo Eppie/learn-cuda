@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GEMM Tile Hierarchy (M06)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+const root = document.getElementById("root");
+vizlib.header(root, "GEMM tile hierarchy (M06)",
+  "Four nested levels of tiling that decompose a (BM × BN) C-block into per-warp and per-thread work. " +
+  "BM/BN/BK = block tile (covered by one CTA). WM/WN = warp tile (covered by one warp; the CTA has " +
+  "(BM/WM)*(BN/WN) warps). TM/TN = per-thread micro-tile in registers. The fourth level (red) is one MMA " +
+  "fragment that one thread holds. Adjust sliders; counts on the right show how many of each level fit.");
+
+const ctrls = vizlib.html("div", { class: "controls" });
+root.appendChild(ctrls);
+const state = { BM: 128, BN: 128, BK: 16, WM: 64, WN: 32, TM: 8, TN: 8 };
+
+function addSlider(name, lo, hi, step) {
+  return vizlib.slider({
+    min: lo, max: hi, step, value: state[name], label: name,
+    onChange: v => { state[name] = v; render(); }
+  });
+}
+const sliders = {
+  BM: addSlider("BM", 32, 256, 32),
+  BN: addSlider("BN", 32, 256, 32),
+  BK: addSlider("BK",  8,  64,  8),
+  WM: addSlider("WM", 16,  128, 16),
+  WN: addSlider("WN", 16,  128, 16),
+  TM: addSlider("TM",  4,   16,  4),
+  TN: addSlider("TN",  4,   16,  4),
+};
+for (const k of Object.keys(sliders)) ctrls.appendChild(sliders[k].node);
+
+const stats = vizlib.html("div", { class: "panel stats" });
+root.appendChild(stats);
+const svgWrap = vizlib.html("div", { class: "panel" });
+root.appendChild(svgWrap);
+
+root.appendChild(vizlib.legend([
+  { color: "#3498db", label: "block tile (BM × BN)" },
+  { color: "#27ae60", label: "warp tile (WM × WN)" },
+  { color: "#e67e22", label: "thread tile (TM × TN)" },
+  { color: "#e74c3c", label: "MMA fragment (16×8)" },
+]));
+
+function render() {
+  // Compute counts.
+  const warpsM = Math.max(1, Math.floor(state.BM / state.WM));
+  const warpsN = Math.max(1, Math.floor(state.BN / state.WN));
+  const numWarps = warpsM * warpsN;
+  const threadsM = Math.max(1, Math.floor(state.WM / state.TM));
+  const threadsN = Math.max(1, Math.floor(state.WN / state.TN));
+  const threadsPerWarp = threadsM * threadsN;
+  const ok = (threadsPerWarp === 32);
+
+  stats.innerHTML =
+    `<b>warps/CTA:</b> ${warpsM}×${warpsN} = ${numWarps}` +
+    ` &nbsp;&nbsp; <b>threads/warp covered:</b> ${threadsM}×${threadsN} = ${threadsPerWarp} ` +
+    (ok ? `<span style="color:${vizlib.STATUS.good}">✓ OK</span>` : `<span style="color:${vizlib.STATUS.bad}">✗ should be 32</span>`) +
+    ` &nbsp;&nbsp; <b>threads/CTA:</b> ${numWarps * 32}` +
+    ` &nbsp;&nbsp; <b>elements/thread:</b> ${state.TM * state.TN}` +
+    ` &nbsp;&nbsp; <b>shared bytes (As+Bs FP16):</b> ~${(2 * state.BK * (state.BM + state.BN) * 2)} B`;
+
+  svgWrap.innerHTML = "";
+  const W=1100, H=540;
+  const svg = vizlib.el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+
+  // Drawing area for the BM×BN tile, scaled.
+  const padL=40, padT=40;
+  const maxDim = 480;
+  const scale = maxDim / Math.max(state.BM, state.BN);
+  const w = state.BN * scale, h = state.BM * scale;
+
+  // Block tile.
+  svg.appendChild(vizlib.el("rect", { x: padL, y: padT, width: w, height: h, fill: "#eaf3fb", stroke: "#3498db", "stroke-width": 2 }));
+  const tBlk = vizlib.el("text", { x: padL, y: padT-8, "font-size": 12, fill: "#3498db" });
+  tBlk.textContent = `block tile  ${state.BM}×${state.BN}  (one CTA)`; svg.appendChild(tBlk);
+
+  // Warp tiles.
+  for (let i = 0; i < warpsM; i++) {
+    for (let j = 0; j < warpsN; j++) {
+      const x = padL + j * state.WN * scale;
+      const y = padT + i * state.WM * scale;
+      svg.appendChild(vizlib.el("rect", {
+        x, y, width: state.WN*scale, height: state.WM*scale,
+        fill: "rgba(39,174,96,0.07)", stroke: "#27ae60", "stroke-width": 1.2
+      }));
+    }
+  }
+
+  // Thread tiles inside the first warp tile only (to keep visual clean).
+  for (let i = 0; i < threadsM; i++) {
+    for (let j = 0; j < threadsN; j++) {
+      const x = padL + j * state.TN * scale;
+      const y = padT + i * state.TM * scale;
+      svg.appendChild(vizlib.el("rect", {
+        x, y, width: state.TN*scale, height: state.TM*scale,
+        fill: "rgba(230,126,34,0.10)", stroke: "#e67e22", "stroke-width": 0.8
+      }));
+    }
+  }
+
+  // MMA fragment indicator (16×8 region in the first thread tile, if it fits).
+  if (state.TM >= 16 && state.TN >= 8) {
+    svg.appendChild(vizlib.el("rect", {
+      x: padL, y: padT, width: 8*scale, height: 16*scale,
+      fill: "rgba(231,76,60,0.18)", stroke: "#e74c3c", "stroke-width": 1.2
+    }));
+  } else {
+    // Show a notional fragment scaled to the thread tile.
+    svg.appendChild(vizlib.el("rect", {
+      x: padL, y: padT, width: state.TN*scale, height: state.TM*scale,
+      fill: "rgba(231,76,60,0.15)", stroke: "#e74c3c", "stroke-width": 1.2
+    }));
+  }
+
+  // Right-side details panel: zoomed warp, zoomed thread.
+  const xZ = padL + w + 60, yZ = padT;
+  // warp zoom
+  const wzS = 220 / Math.max(state.WM, state.WN);
+  svg.appendChild(vizlib.el("text", { x: xZ, y: yZ-10, "font-size": 12, fill: "#27ae60", "font-weight": "bold" }));
+  svg.lastChild.textContent = `warp tile  ${state.WM}×${state.WN}  →  ${threadsM}×${threadsN} threads`;
+  svg.appendChild(vizlib.el("rect", { x: xZ, y: yZ, width: state.WN*wzS, height: state.WM*wzS,
+    fill: "rgba(39,174,96,0.08)", stroke: "#27ae60", "stroke-width": 2 }));
+  for (let i = 0; i < threadsM; i++) {
+    for (let j = 0; j < threadsN; j++) {
+      const x = xZ + j * state.TN * wzS;
+      const y = yZ + i * state.TM * wzS;
+      svg.appendChild(vizlib.el("rect", { x, y, width: state.TN*wzS, height: state.TM*wzS,
+        fill: "rgba(230,126,34,0.12)", stroke: "#e67e22", "stroke-width": 0.6 }));
+    }
+  }
+  // thread zoom — TM×TN block of 1-pixel cells
+  const tzX = xZ, tzY = yZ + 280;
+  svg.appendChild(vizlib.el("text", { x: tzX, y: tzY-8, "font-size": 12, fill: "#e67e22", "font-weight": "bold" }));
+  svg.lastChild.textContent = `thread tile  ${state.TM}×${state.TN}  =  ${state.TM*state.TN} regs of C`;
+  const tzS = 14;
+  for (let i = 0; i < state.TM; i++) {
+    for (let j = 0; j < state.TN; j++) {
+      svg.appendChild(vizlib.el("rect", {
+        x: tzX + j*tzS, y: tzY + i*tzS, width: tzS-1, height: tzS-1,
+        fill: "rgba(230,126,34,0.30)", stroke: "#e67e22", "stroke-width": 0.4
+      }));
+    }
+  }
+
+  // K-dimension annotation.
+  const kT = vizlib.el("text", { x: padL, y: padT + h + 22, "font-size": 12 });
+  kT.textContent = `K-loop step: BK=${state.BK}  (each iteration loads BK columns of A and BK rows of B into shared)`;
+  svg.appendChild(kT);
+
+  svgWrap.appendChild(svg);
+}
+
+render();
+</script>
+</body>
+</html>

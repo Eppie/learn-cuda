@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Persistent kernel doorbell (M11)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+const root = document.getElementById("root");
+vizlib.header(root, "Persistent-kernel doorbell handshake (M11 low latency)",
+  "A persistent kernel pre-launches and spins on a flag in pinned (host-mapped) memory; the host writes " +
+  "1 to the doorbell, the kernel sees it (PCIe BAR1 read), processes the request, signals the host via a " +
+  "response flag, and the host clears state for the next round. PCIe Gen4 round-trip latencies on " +
+  "consumer x86 are typically 5–15 µs each direction (not 1–3 µs as folklore suggests). Press play to " +
+  "watch one round-trip; the timeline at right shows accumulated latency.");
+
+const ctrls = vizlib.html("div", { class: "controls" });
+root.appendChild(ctrls);
+const state = { stage: 0, playing: false };
+const stages = [
+  { name: "host idle",            actor: "host",   desc: "host has no request; *dbell = 0, *resp = 0", lat: 0 },
+  { name: "host writes 1",        actor: "host",   desc: "host: *dbell = 1   (a PCIe-MMIO store; ≈ 5 µs to be visible to GPU)", lat: 5 },
+  { name: "kernel sees doorbell", actor: "kernel", desc: "kernel: while (*dbell == 0) {} → spins, then reads 1", lat: 0 },
+  { name: "kernel works",         actor: "kernel", desc: "kernel runs the request body (typically ~1–3 µs of compute)", lat: 2 },
+  { name: "kernel signals",       actor: "kernel", desc: "kernel: __threadfence_system(); *resp = 1   (≈ 5 µs to host)", lat: 5 },
+  { name: "host sees response",   actor: "host",   desc: "host: while (*resp == 0) {} → loads 1", lat: 0 },
+  { name: "host clears",          actor: "host",   desc: "host: *resp = 0; *dbell = 0   (ready for next round)", lat: 0 },
+];
+
+ctrls.appendChild(vizlib.button("◀ rewind", () => { state.stage = 0; render(); }));
+ctrls.appendChild(vizlib.button("step ▶", () => { state.stage = Math.min(state.stage+1, stages.length-1); render(); }));
+const playBtn = vizlib.button("play", () => togglePlay());
+ctrls.appendChild(playBtn);
+
+const info = vizlib.html("div", { class: "panel stats" });
+root.appendChild(info);
+const svgWrap = vizlib.html("div", { class: "panel" });
+root.appendChild(svgWrap);
+
+function togglePlay() {
+  state.playing = !state.playing;
+  playBtn.textContent = state.playing ? "pause" : "play";
+  if (state.playing) tick();
+}
+function tick() {
+  if (!state.playing) return;
+  if (state.stage >= stages.length-1) { state.playing = false; playBtn.textContent = "play"; return; }
+  state.stage++; render();
+  setTimeout(tick, 1100);
+}
+
+function render() {
+  svgWrap.innerHTML = "";
+  const W = 1100, H = 480;
+  const svg = vizlib.el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+
+  // Two actor lanes.
+  const hostX = 80, kernelX = 720;
+  svg.appendChild(vizlib.el("rect", { x: hostX-20, y: 30, width: 200, height: H-60,
+    fill: "#fef9e7", stroke: "#b7950b", rx: 6 }));
+  svg.appendChild(vizlib.el("rect", { x: kernelX-20, y: 30, width: 200, height: H-60,
+    fill: "#eaf3fb", stroke: "#1f618d", rx: 6 }));
+  svg.appendChild(vizlib.el("text", { x: hostX+80, y: 50, "text-anchor": "middle", "font-size": 14, "font-weight": "bold" })).textContent = "HOST (CPU)";
+  svg.appendChild(vizlib.el("text", { x: kernelX+80, y: 50, "text-anchor": "middle", "font-size": 14, "font-weight": "bold" })).textContent = "KERNEL (GPU, persistent)";
+
+  // Doorbell + response indicators.
+  const dbell = state.stage >= 1 && state.stage < 6;
+  const resp  = state.stage >= 4 && state.stage < 6;
+  // Place between the lanes.
+  const flagX = (hostX+kernelX)/2;
+  svg.appendChild(vizlib.el("rect", { x: flagX-50, y: 100, width: 100, height: 40,
+    fill: dbell ? vizlib.STATUS.bad : "#dfe6e9", stroke: "#222" }));
+  svg.appendChild(vizlib.el("text", { x: flagX, y: 125, "text-anchor": "middle", "font-size": 13 })).textContent =
+    `*dbell = ${dbell ? 1 : 0}`;
+  svg.appendChild(vizlib.el("rect", { x: flagX-50, y: 160, width: 100, height: 40,
+    fill: resp ? vizlib.STATUS.good : "#dfe6e9", stroke: "#222" }));
+  svg.appendChild(vizlib.el("text", { x: flagX, y: 185, "text-anchor": "middle", "font-size": 13 })).textContent =
+    `*resp  = ${resp ? 1 : 0}`;
+
+  // Stage list.
+  let cumLat = 0;
+  for (let i = 0; i < stages.length; i++) {
+    const y = 240 + i*30;
+    const passed = i < state.stage;
+    const current = i === state.stage;
+    const stage = stages[i];
+    cumLat += stage.lat;
+    const dot = vizlib.el("circle", { cx: 30, cy: y, r: 7,
+      fill: current ? vizlib.STATUS.bad : (passed ? vizlib.STATUS.good : "#bdc3c7"),
+      stroke: "#222" });
+    svg.appendChild(dot);
+    const t = vizlib.el("text", { x: 50, y: y+5, "font-size": 12,
+      fill: current ? "#000" : (passed ? "#555" : "#888"),
+      "font-weight": current ? "bold" : "normal" });
+    t.textContent = `${stage.name}  —  ${stage.desc}` + (stage.lat > 0 ? `  [+${stage.lat} µs]` : "");
+    svg.appendChild(t);
+    if (passed || current) {
+      const lt = vizlib.el("text", { x: W-110, y: y+5, "font-size": 12, fill: "#555" });
+      lt.textContent = `t = ${cumLat} µs`; svg.appendChild(lt);
+    }
+  }
+
+  // Edge labels: PCIe arrow.
+  if (state.stage === 1 || state.stage === 2) {
+    const ax = hostX+170, ay = 120, bx = flagX-50, by = 120;
+    svg.appendChild(vizlib.el("path", { d: `M${ax},${ay} L${bx},${by}`, stroke: "#c0392b", "stroke-width": 2 }));
+    svg.appendChild(vizlib.el("text", { x: (ax+bx)/2, y: ay-6, "text-anchor": "middle",
+      "font-size": 11, fill: "#c0392b" })).textContent = "PCIe write ≈ 5 µs";
+  }
+  if (state.stage === 4 || state.stage === 5) {
+    const ax = flagX+50, ay = 180, bx = kernelX-20, by = 180;
+    svg.appendChild(vizlib.el("path", { d: `M${bx},${by} L${ax},${ay}`, stroke: "#27ae60", "stroke-width": 2 }));
+    svg.appendChild(vizlib.el("text", { x: (ax+bx)/2, y: ay-6, "text-anchor": "middle",
+      "font-size": 11, fill: "#27ae60" })).textContent = "PCIe write ≈ 5 µs";
+  }
+
+  svgWrap.appendChild(svg);
+
+  // Total latency tally.
+  let total = 0;
+  for (let i = 0; i <= state.stage; i++) total += stages[i].lat;
+  info.innerHTML =
+    `<b>cumulative latency:</b> ${total} µs ` +
+    `&nbsp;&nbsp;<span style="color:#888">(typical full round-trip on x86 + PCIe Gen4 RTX 4090: ≈ 12 µs; production HFT skips PCIe entirely with GPUDirect RDMA from NIC.)</span>`;
+}
+
+render();
+</script>
+</body>
+</html>

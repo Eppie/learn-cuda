@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WMMA / mma.sync Fragment Layout (M07)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+const root = document.getElementById("root");
+vizlib.header(root, "WMMA / mma.sync fragment layout (M07)",
+  "How a 16×16 (or 16×8) tile maps onto the 32 lanes of a warp inside a tensor-core MMA. " +
+  "Each lane holds a few elements; this is the lane→element layout you must obey when writing or " +
+  "reading fragments via ldmatrix / mma.sync (PTX-documented). WMMA's wmma::fragment is opaque, but the " +
+  "underlying mapping is the same on Ampere+. Hover a cell to see which lane owns it. " +
+  "Toggle between m16n16k16 (used by wmma) and m16n8k16 (the standard mma.sync FP16 form).");
+
+const ctrls = vizlib.html("div", { class: "controls" });
+root.appendChild(ctrls);
+const state = { shape: "16x16", which: "C" };
+
+ctrls.appendChild(vizlib.dropdown({
+  label: "shape", value: "16x16",
+  options: [
+    { value: "16x16", text: "m16n16k16 (WMMA)" },
+    { value: "16x8",  text: "m16n8k16 (mma.sync)" },
+  ],
+  onChange: v => { state.shape = v; render(); }
+}).node);
+
+ctrls.appendChild(vizlib.dropdown({
+  label: "fragment", value: "C",
+  options: [
+    { value: "A", text: "A (operand, FP16)" },
+    { value: "B", text: "B (operand, FP16)" },
+    { value: "C", text: "C/D (accumulator, FP32 or FP16)" },
+  ],
+  onChange: v => { state.which = v; render(); }
+}).node);
+
+const stats = vizlib.html("div", { class: "panel stats" });
+root.appendChild(stats);
+const svgWrap = vizlib.html("div", { class: "panel" });
+root.appendChild(svgWrap);
+
+// Lane-to-element mapping for the mma.sync m16n8k16 FP16 layouts.
+// References: PTX ISA 8.x §9.7.13.4 (mma.sync.m16n8k16).
+//   D fragment (m16n8 result): each thread holds 4 FP32 values at:
+//     row = (laneId/4)        col = (laneId%4)*2     -> elt 0
+//     row = (laneId/4)        col = (laneId%4)*2 + 1 -> elt 1
+//     row = (laneId/4) + 8    col = (laneId%4)*2     -> elt 2
+//     row = (laneId/4) + 8    col = (laneId%4)*2 + 1 -> elt 3
+//   A fragment (m16k16 FP16): 8 halfs per thread (4 halfs × 2 K-halves).
+//   B fragment (k16n8 FP16): 4 halfs per thread.
+// For pedagogy we render D for both; for A we extend the D pattern across K=16.
+function laneOwner(r, c) {
+  if (state.shape === "16x8") {
+    // m16n8 D layout from the PTX docs.
+    if (state.which === "C") {
+      // 16 rows × 8 cols. Each lane owns 4 elements as described above.
+      const groupRow = r >= 8 ? 1 : 0;
+      const inRow = r % 8;     // 0..7 -> laneId/4
+      const colPair = Math.floor(c / 2);  // 0..3
+      const lane = inRow * 4 + colPair;
+      const eltIdx = groupRow * 2 + (c % 2);
+      return { lane, elt: eltIdx };
+    }
+    if (state.which === "A") {
+      // m=16,k=16. Use the m16n8 D-style row mapping; each lane holds 8 halfs.
+      const groupRow = r >= 8 ? 1 : 0;
+      const inRow = r % 8;
+      const colPair = Math.floor(c / 2) % 4;     // pair within k group
+      const kGroup  = Math.floor(c / 8);          // 0 or 1
+      const lane = inRow * 4 + colPair;
+      const eltIdx = kGroup * 4 + groupRow * 2 + (c % 2);
+      return { lane, elt: eltIdx };
+    }
+    if (state.which === "B") {
+      // k=16, n=8. Rows are k. Each lane holds 4 halfs.
+      const kGroup = r >= 8 ? 1 : 0;
+      const inRow = r % 8;
+      const colPair = Math.floor(c / 2);
+      const lane = inRow * 4 + colPair;
+      const eltIdx = kGroup * 2 + (c % 2);
+      return { lane, elt: eltIdx };
+    }
+  } else {
+    // m16n16k16 wmma — opaque, but for visualization we tile the m16n8 layout twice.
+    // Use the D layout extended to 16 cols by tiling.
+    if (state.which === "C") {
+      const groupRow = r >= 8 ? 1 : 0;
+      const inRow = r % 8;
+      const colHalf = c >= 8 ? 1 : 0;
+      const cMod = c % 8;
+      const colPair = Math.floor(cMod / 2);
+      const lane = inRow * 4 + colPair;
+      const eltIdx = colHalf * 4 + groupRow * 2 + (cMod % 2);
+      return { lane, elt: eltIdx };
+    }
+    if (state.which === "A" || state.which === "B") {
+      // Same skeleton; A is m=16 × k=16, B is k=16 × n=16.
+      const groupRow = r >= 8 ? 1 : 0;
+      const inRow = r % 8;
+      const colHalf = c >= 8 ? 1 : 0;
+      const cMod = c % 8;
+      const colPair = Math.floor(cMod / 2);
+      const lane = inRow * 4 + colPair;
+      const eltIdx = colHalf * 4 + groupRow * 2 + (cMod % 2);
+      return { lane, elt: eltIdx };
+    }
+  }
+}
+
+function render() {
+  svgWrap.innerHTML = "";
+  const rows = 16;
+  const cols = state.shape === "16x8" ? 8 : 16;
+
+  const cell = 30;
+  const padL = 50, padT = 40;
+  const W = padL + cols*cell + 360, H = padT + rows*cell + 60;
+  const svg = vizlib.el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+
+  // Title.
+  const t = vizlib.el("text", { x: 10, y: 22, "font-size": 13, "font-weight": "bold" });
+  t.textContent = `Fragment ${state.which} of shape ${state.shape}: each cell labeled "lane.elt" (the lane that holds it, and which of its register slots it occupies).`;
+  svg.appendChild(t);
+
+  // Cells colored by lane.
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const owner = laneOwner(r, c);
+      const fill = vizlib.BANK_PALETTE[owner.lane % 32];
+      const x = padL + c*cell, y = padT + r*cell;
+      svg.appendChild(vizlib.el("rect", { x, y, width: cell-1, height: cell-1, fill, stroke: "#444", "stroke-width": 0.4 }));
+      const tt = vizlib.el("text", { x: x+cell/2, y: y+cell/2+4, "text-anchor": "middle", "font-size": 9, fill: "#fff" });
+      tt.textContent = `${owner.lane}.${owner.elt}`; svg.appendChild(tt);
+    }
+  }
+
+  // Row/col labels.
+  for (let i = 0; i < rows; i++) {
+    const t = vizlib.el("text", { x: padL-6, y: padT + i*cell + cell/2 + 4, "text-anchor": "end", "font-size": 10 });
+    t.textContent = i; svg.appendChild(t);
+  }
+  for (let j = 0; j < cols; j++) {
+    const t = vizlib.el("text", { x: padL + j*cell + cell/2, y: padT-6, "text-anchor": "middle", "font-size": 10 });
+    t.textContent = j; svg.appendChild(t);
+  }
+
+  // Legend: 32 lanes.
+  const lx = padL + cols*cell + 30, ly = padT;
+  svg.appendChild(vizlib.el("text", { x: lx, y: ly-8, "font-size": 12, "font-weight": "bold" }));
+  svg.lastChild.textContent = "32 lanes (color → lane id)";
+  for (let i = 0; i < 32; i++) {
+    const px = lx + (i % 8) * 36;
+    const py = ly + Math.floor(i / 8) * 24;
+    svg.appendChild(vizlib.el("rect", { x: px, y: py, width: 30, height: 18,
+      fill: vizlib.BANK_PALETTE[i], stroke: "#444" }));
+    const tt = vizlib.el("text", { x: px+15, y: py+13, "text-anchor": "middle", "font-size": 10, fill: "#fff" });
+    tt.textContent = i; svg.appendChild(tt);
+  }
+
+  // Notes.
+  const noteY = ly + 130;
+  const notes = [
+    "Per-thread elements:",
+    state.shape === "16x8"
+      ? (state.which === "C" ? "  4 (FP32) — D row pairs (r, r+8)"
+                              : state.which === "A" ? "  8 (FP16) — 4 halfs × 2 K-halves"
+                                                     : "  4 (FP16) — k row pairs (k, k+8)")
+      : "  8 (FP16/FP32) — wmma::fragment is opaque",
+    "",
+    "Kernel sketch (m16n8k16):",
+    "  ldmatrix.x4 → frag A (8 halfs / lane)",
+    "  ldmatrix.x2 → frag B (4 halfs / lane)",
+    "  mma.sync.m16n8k16 D, A, B, C",
+    "  st.shared / store D",
+  ];
+  for (let i = 0; i < notes.length; i++) {
+    const tt = vizlib.el("text", { x: lx, y: noteY + i*16, "font-size": 12, fill: "#333" });
+    tt.textContent = notes[i]; svg.appendChild(tt);
+  }
+
+  svgWrap.appendChild(svg);
+
+  stats.innerHTML = `<b>shape:</b> ${state.shape} &nbsp;&nbsp; <b>fragment:</b> ${state.which} ` +
+    `&nbsp;&nbsp; <span style="color:#888">(layout based on PTX ISA mma.sync.m16n8k16; m16n16k16 shown as a 2× tile.)</span>`;
+}
+
+render();
+</script>
+</body>
+</html>

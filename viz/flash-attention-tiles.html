@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FlashAttention Tiles (M10)</title>
+<script src="lib.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+vizlib.injectBaseStyles();
+const root = document.getElementById("root");
+vizlib.header(root, "FlashAttention tile flow (M10)",
+  "FlashAttention keeps Q resident in registers (one Q-row block per worker), then streams K and V " +
+  "tiles from DRAM across the inner loop. For each K-tile it computes S = Qᵀ·Kᵀ, applies the online " +
+  "softmax recurrence (running m, l), and accumulates O ← rescale(O) + softmax(S)·V. Watch K/V slide " +
+  "across the columns; the per-tile (m, l) update on the right and the O accumulator block at the " +
+  "bottom show the recurrence in action. No N×N matrix is ever materialized.");
+
+const ctrls = vizlib.html("div", { class: "controls" });
+root.appendChild(ctrls);
+const state = { tile: 0, numTiles: 8, playing: false };
+
+ctrls.appendChild(vizlib.button("◀ rewind", () => { state.tile = 0; render(); }));
+ctrls.appendChild(vizlib.button("step ▶", () => { state.tile = Math.min(state.tile+1, state.numTiles); render(); }));
+const playBtn = vizlib.button("play", () => togglePlay());
+ctrls.appendChild(playBtn);
+
+ctrls.appendChild(vizlib.slider({
+  min: 4, max: 16, step: 1, value: 8, label: "K/V tiles",
+  onChange: v => { state.numTiles = v; state.tile = 0; render(); }
+}).node);
+
+const info = vizlib.html("div", { class: "panel stats" });
+root.appendChild(info);
+const svgWrap = vizlib.html("div", { class: "panel" });
+root.appendChild(svgWrap);
+
+function togglePlay() {
+  state.playing = !state.playing;
+  playBtn.textContent = state.playing ? "pause" : "play";
+  if (state.playing) tick();
+}
+function tick() {
+  if (!state.playing) return;
+  if (state.tile >= state.numTiles) { state.playing = false; playBtn.textContent = "play"; return; }
+  state.tile++;
+  render();
+  setTimeout(tick, 700);
+}
+
+// Synthetic data so the running (m, l) and O actually evolve.
+let seed = 0;
+function rand() { seed = (seed*9301 + 49297) % 233280; return seed/233280; }
+function buildData() {
+  seed = 12345;
+  const data = [];
+  for (let t = 0; t < state.numTiles; t++) {
+    const sBlock = []; // 4 (Br) × 4 (Bc) tile of S = Q·Kᵀ
+    for (let i = 0; i < 4; i++) {
+      const row = [];
+      for (let j = 0; j < 4; j++) row.push((rand()*6 - 1).toFixed(2));
+      sBlock.push(row);
+    }
+    data.push(sBlock);
+  }
+  return data;
+}
+const data = buildData();
+
+function render() {
+  // Online softmax over tiles, accumulating into O (4-wide).
+  const Br = 4, Bc = 4;
+  let m = new Array(Br).fill(-Infinity);
+  let l = new Array(Br).fill(0);
+  let O = Array.from({length:Br}, () => new Array(4).fill(0));
+
+  for (let t = 0; t < state.tile; t++) {
+    const S = data[t];
+    // tile max per row
+    const mNew = m.slice();
+    for (let i = 0; i < Br; i++) {
+      let mt = -Infinity;
+      for (let j = 0; j < Bc; j++) {
+        const v = parseFloat(S[i][j]);
+        if (v > mt) mt = v;
+      }
+      mNew[i] = Math.max(m[i], mt);
+    }
+    // P = exp(S - mNew), l_t = sum P, alpha = exp(m - mNew)
+    const lNew = new Array(Br).fill(0);
+    const ON = Array.from({length:Br}, () => new Array(4).fill(0));
+    for (let i = 0; i < Br; i++) {
+      const alpha = m[i] === -Infinity ? 0 : Math.exp(m[i] - mNew[i]);
+      for (let j = 0; j < Bc; j++) {
+        const p = Math.exp(parseFloat(S[i][j]) - mNew[i]);
+        lNew[i] += p;
+      }
+      lNew[i] += alpha * l[i];
+      // O_new = alpha * O + P * V (synthesize V from S+1)
+      for (let k = 0; k < 4; k++) {
+        let pv = 0;
+        for (let j = 0; j < Bc; j++) {
+          const p = Math.exp(parseFloat(S[i][j]) - mNew[i]);
+          const v = (parseFloat(S[i][j]) + 1) % 4; // synthetic V
+          pv += p * v;
+        }
+        ON[i][k] = alpha * O[i][k] + pv;
+      }
+    }
+    m = mNew; l = lNew; O = ON;
+  }
+
+  svgWrap.innerHTML = "";
+  const W = 1100, H = 540;
+  const svg = vizlib.el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+
+  // Q block (left, persistent).
+  const qX = 20, qY = 50, qS = 28;
+  svg.appendChild(vizlib.el("text", { x: qX, y: qY-10, "font-size": 12, "font-weight": "bold", fill: "#2c3e50" }));
+  svg.lastChild.textContent = `Q  (${Br}×4, in registers)`;
+  for (let i = 0; i < Br; i++) for (let j = 0; j < 4; j++) {
+    svg.appendChild(vizlib.el("rect", { x: qX+j*qS, y: qY+i*qS, width: qS-1, height: qS-1,
+      fill: "#3498db", stroke: "#2c3e50" }));
+  }
+
+  // K/V row (sliding tiles).
+  const kY = 50, kS = 28, kX0 = qX + 4*qS + 30;
+  svg.appendChild(vizlib.el("text", { x: kX0, y: kY-10, "font-size": 12, "font-weight": "bold", fill: "#27ae60" }));
+  svg.lastChild.textContent = `K, V  (${state.numTiles} tiles, streamed from DRAM)`;
+  const tileTotalW = (Bc+1)*kS;
+  for (let t = 0; t < state.numTiles; t++) {
+    const x0 = kX0 + t*tileTotalW;
+    const active = t < state.tile;
+    const current = t === state.tile - 1;
+    const fill = active ? (current ? "#16a085" : "#a9dfbf") : "#ecf0f1";
+    for (let r = 0; r < Br; r++) for (let c = 0; c < Bc; c++) {
+      svg.appendChild(vizlib.el("rect", { x: x0+c*kS, y: kY+r*kS, width: kS-1, height: kS-1,
+        fill, stroke: current ? "#0e6655" : "#7f8c8d", "stroke-width": current ? 1.5 : 0.5 }));
+    }
+    const tt = vizlib.el("text", { x: x0+Bc*kS/2, y: kY+Br*kS+14, "text-anchor": "middle", "font-size": 10, fill: "#333" });
+    tt.textContent = "K"+t; svg.appendChild(tt);
+  }
+
+  // S = QKᵀ block for current tile.
+  const sX = 20, sY = qY + Br*qS + 60;
+  svg.appendChild(vizlib.el("text", { x: sX, y: sY-10, "font-size": 12, "font-weight": "bold", fill: "#8e44ad" }));
+  svg.lastChild.textContent = `S = Q·Kᵀ  (current tile)`;
+  if (state.tile > 0) {
+    const cur = data[state.tile-1];
+    for (let i = 0; i < Br; i++) for (let j = 0; j < Bc; j++) {
+      svg.appendChild(vizlib.el("rect", { x: sX+j*40, y: sY+i*30, width: 38, height: 28,
+        fill: "#e8daef", stroke: "#8e44ad" }));
+      const t = vizlib.el("text", { x: sX+j*40+19, y: sY+i*30+18, "text-anchor": "middle", "font-size": 11 });
+      t.textContent = cur[i][j]; svg.appendChild(t);
+    }
+  }
+
+  // (m, l) per row.
+  const mlX = sX + 4*40 + 60, mlY = sY;
+  svg.appendChild(vizlib.el("text", { x: mlX, y: mlY-10, "font-size": 12, "font-weight": "bold", fill: "#d35400" }));
+  svg.lastChild.textContent = `running (m_i, l_i) per Q-row`;
+  for (let i = 0; i < Br; i++) {
+    const t = vizlib.el("text", { x: mlX, y: mlY + i*30 + 20, "font-size": 12, fill: "#333" });
+    t.textContent = `row ${i}: m=${m[i] === -Infinity ? "—" : m[i].toFixed(2)}, l=${l[i].toFixed(2)}`;
+    svg.appendChild(t);
+  }
+
+  // O accumulator (bottom).
+  const oX = 20, oY = sY + 4*30 + 60;
+  svg.appendChild(vizlib.el("text", { x: oX, y: oY-10, "font-size": 12, "font-weight": "bold", fill: "#c0392b" }));
+  svg.lastChild.textContent = `O  accumulator (rescaled each tile)`;
+  for (let i = 0; i < Br; i++) for (let j = 0; j < 4; j++) {
+    const v = O[i][j];
+    const intensity = Math.min(1, Math.abs(v) / 6);
+    svg.appendChild(vizlib.el("rect", { x: oX+j*44, y: oY+i*32, width: 42, height: 30,
+      fill: `rgba(192,57,43,${0.15 + 0.5*intensity})`, stroke: "#c0392b" }));
+    const t = vizlib.el("text", { x: oX+j*44+21, y: oY+i*32+19, "text-anchor": "middle", "font-size": 11 });
+    t.textContent = v.toFixed(2); svg.appendChild(t);
+  }
+
+  svgWrap.appendChild(svg);
+
+  info.innerHTML =
+    `<b>K/V tile:</b> ${state.tile} / ${state.numTiles} ` +
+    `&nbsp;&nbsp; <span style="color:#888">no full N×N S matrix is ever in memory; only per-tile S and the running (m, l, O).</span>`;
+}
+
+render();
+</script>
+</body>
+</html>
