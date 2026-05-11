@@ -240,11 +240,36 @@ cuBLAS split sum     440 µs    39       24%  ← naive baseline
 Compute roofline     104 µs   165      100%  ← unreachable in practice
 ```
 
-**We beat cuBLAS-split by 1.5×.** The fused flash kernel wins because (a)
-cuBLAS isn't well-tuned for K=64 ("skinny K"), and (b) we never materialize
-the N×N S/P matrix to DRAM. cuBLAS itself hits only 18-33% of its own
-tensor peak on this shape; the gap between "what cuBLAS does on a
-cube-shaped GEMM" and "what cuBLAS does on our skinny shape" is real.
+**We beat cuBLAS-split by 1.5× — but this isn't "we beat cuBLAS."**
+
+cuBLAS is a GEMM library; it has no mechanism to fuse across kernel
+boundaries.  Computing attention with cuBLAS *forces* materializing S =
+Q·K^T (N²·2 B = 128 MB at N=8192) and P = softmax(S) (another 128 MB) to
+DRAM between the two matmuls.  That ~512 MB of intermediate traffic is the
+penalty for "library-only" attention, not a cuBLAS weakness.
+
+The honest framing: cuBLAS-split is a **different algorithm** (3-kernel
+materialized) than what we do (1-kernel fused FA-1).  S and P are
+intermediates — they're never returned to the user — but the API boundary
+of GEMM forces them through DRAM.
+
+The **apples-to-apples** comparison is to a fused production kernel:
+**cuDNN MHA / FlashAttention-2 / xFormers**, all of which fuse the three
+ops just like we do.  Those land at ~80-130 TF/s at this shape — that's
+the realistic ceiling for our problem, and the gap from our 58 TF/s to
+~100 TF/s is real engineering (swizzled smem, STAGES=3, register-resident
+Q across iters).  See the "remaining gap" section below.
+
+cuBLAS-split's 39 TF/s number is still informative as the "library-only
+floor" — what an ML practitioner would get *without* knowing about
+flash-attention.  It's a real data point on the cost of the materialization
+the algorithm avoids.  Just don't read it as "us being clever" — it's
+"flash being a better algorithm than three separate ops."
+
+**TODO-USER:** for a true production-fused reference, add a cuDNN MHA
+benchmark via the cuDNN frontend SDPA op (cudnn_frontend Python or C++
+wrappers).  ~100-150 LOC; not in `roofline.cu` because the cuDNN frontend
+dependency complicates the standalone build.
 
 **Where the remaining gap to roofline goes** (the 2.85× factor between our
 58 TF/s and the 165 TF/s ceiling): online softmax overhead (the per-iter
