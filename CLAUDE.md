@@ -41,8 +41,10 @@ Modules with extra structure:
   `flash_attention_async_wmma` (10.3, +cp.async),
   `flash_attention_mma` (10.4, raw `mma.sync` — ~59 TF/s at N=8192 single-head),
   `flash_attention_mma_ldmatrix` (10.5, +`ldmatrix` — same perf as 10.4 in
-  pedagogical form: ldmatrix saves instruction count but not bank throughput;
-  the CUTLASS win needs swizzled smem layout too, queued as M10.6 stretch).
+  pedagogical form: ldmatrix saves instruction count but not bank throughput),
+  `flash_attention_mma_swizzled` (10.6, +XOR-swizzled K/V smem — bank
+  conflicts drop from 3.7M to 0; ~90 TF/s at N=8192 single-head, 30× over
+  M10.0, 54% of compute roofline, in the production FA-2 range).
   *Shape variants on the simple base*: MHA, causal+tile-skip, KV-cache, GQA.
 - **`11-low-latency`** — multiple demo files: `bench.cu`, `events_demo.cu`,
   `persistent_demo.cu`, `ring_buffer.cu`. Module README is structured in

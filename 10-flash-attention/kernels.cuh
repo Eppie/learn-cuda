@@ -2063,6 +2063,355 @@ inline void launch_flash_mma_ldmatrix(const __half* Q, const __half* K, const __
 }
 
 // ============================================================================
+// M10.6 — flash_attention_mma_swizzled
+// ============================================================================
+// Same tile shape, mma.sync, ldmatrix.x4 for Q, ldmatrix.x2.trans for V, and
+// cp.async double-buffer as M10.5. The one change: K/V/Q shared tiles use an
+// XOR-permuted column layout so that the ldmatrix lane→pointer pattern hits
+// 8 different bank-groups instead of all stacking on the same column.
+//
+// Layout (per row r, intra-row half-element offset c ∈ [0, D)):
+//   chunk        = c >> 3                       // 16-byte chunk index (0..7)
+//   chunk_swizz  = chunk ^ (r & 7)
+//   c_swizz      = (c & 7) | (chunk_swizz << 3)
+//   stored at:   smem[r * D + c_swizz]
+//
+// Applied symmetrically to writes (cp.async) and reads (ldmatrix / __half2),
+// so values are consistent regardless of permutation. Within any group of
+// 8 consecutive rows r..r+7, the swizzle is a bijection on chunks, so 8 lanes
+// reading the same column index across those rows touch 8 distinct chunks.
+// ============================================================================
+__device__ __forceinline__ int m10_6_swizzle(int row, int col_halves) {
+    // 16-byte chunk = 8 halves. chunk_idx = col_halves >> 3 (0..7 for D=64).
+    int chunk   = col_halves >> 3;
+    int chunk_s = chunk ^ (row & 7);
+    return (col_halves & 7) | (chunk_s << 3);
+}
+
+__device__ __forceinline__ void m10_6_cp_async_16(void* smem_dst, const void* gmem_src) {
+    __pipeline_memcpy_async(smem_dst, gmem_src, sizeof(int4));
+}
+
+__global__ void flash_attention_mma_swizzled(const __half* __restrict__ Q,
+                                             const __half* __restrict__ K,
+                                             const __half* __restrict__ V,
+                                             float*        __restrict__ O,
+                                             int N) {
+    int warp_id = threadIdx.x >> 5;
+    int lane    = threadIdx.x & 31;
+    int q_lane  = lane >> 2;    // 0..7
+    int t_lane  = lane & 3;     // 0..3
+
+    int row_base = blockIdx.x * BR4_BLOCK + warp_id * BR4;
+
+    int row_top = row_base + q_lane;
+    int row_bot = row_base + q_lane + 8;
+
+    __shared__ __half Ks[STAGES_M10_4][BC4 * D4];
+    __shared__ __half Vs[STAGES_M10_4][BC4 * D4];
+
+    __shared__ __half Qs_blk[WARPS_M10_4][BR4 * D4];
+    __half* Qs = Qs_blk[warp_id];
+
+    // ---- Stage Q for this warp (swizzled write) ----
+    // BR4 * D4 = 16 * 64 = 1024 halves. 32 lanes → 32 halves/lane. To keep
+    // the swizzle aligned on 8-half chunks, each lane writes 8 contiguous
+    // halves per pass: 1024 halves / 8 halves/pass / 32 lanes = 4 passes.
+    {
+        constexpr int VEC_HALVES   = 8;
+        constexpr int VECS_PER_ROW = D4 / VEC_HALVES;          // 8
+        constexpr int N_VECS       = (BR4 * D4) / VEC_HALVES;  // 128
+        #pragma unroll
+        for (int p = 0; p < N_VECS / 32; ++p) {
+            int t = p * 32 + lane;
+            int r = t / VECS_PER_ROW;
+            int c = (t % VECS_PER_ROW) * VEC_HALVES;
+            int row_global = row_base + r;
+            int c_sw = m10_6_swizzle(r, c);
+            // Vector half8 load/store via int4.
+            int4 v;
+            if (row_global < N) {
+                v = *reinterpret_cast<const int4*>(&Q[row_global * D4 + c]);
+            } else {
+                v = make_int4(0, 0, 0, 0);
+            }
+            *reinterpret_cast<int4*>(&Qs[r * D4 + c_sw]) = v;
+        }
+    }
+    __syncwarp();
+
+    // ---- Pre-load Q A-fragments via ldmatrix.x4 on swizzled layout ----
+    // Each ldmatrix.x4 reads a 16×16 A fragment. Lane L gives a row pointer:
+    //   tile      = L >> 3   (0..3)
+    //   row_in_t  = L & 7    (0..7)
+    //   row_block = tile & 1 (0 or 1: rows 0-7 vs 8-15)
+    //   col_block = tile >> 1 (0 or 1: cols 0-7 vs 8-15)
+    //   row = row_block * 8 + row_in_t
+    //   col_base (logical) = kk * 16 + col_block * 8
+    // The hardware then reads 8 contiguous halves from that pointer (= 1 chunk).
+    // With swizzle: pointer = &Qs[row * D + swizzle(row, col_base)]. Since
+    // col_base is 8-aligned, swizzle(row, col_base) is also 8-aligned, so the
+    // 8 read halves are the original logical [col_base..col_base+7] of row.
+    uint32_t q_frag[K_CHUNKS_S][4];
+    {
+        int tile      = lane >> 3;
+        int row_in_t  = lane & 7;
+        int row_block = tile & 1;
+        int col_block = tile >> 1;
+        int row = row_block * 8 + row_in_t;
+        #pragma unroll
+        for (int kk = 0; kk < K_CHUNKS_S; ++kk) {
+            int col_base   = kk * 16 + col_block * 8;
+            int col_sw     = m10_6_swizzle(row, col_base);
+            const __half* row_addr = &Qs[row * D4 + col_sw];
+            uint32_t smem_int = __cvta_generic_to_shared(row_addr);
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(q_frag[kk][0]), "=r"(q_frag[kk][1]),
+                  "=r"(q_frag[kk][2]), "=r"(q_frag[kk][3])
+                :  "r"(smem_int));
+        }
+    }
+
+    // ---- O accumulator ----
+    float o_frag[D_CHUNKS_O][4];
+    #pragma unroll
+    for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+        o_frag[dc][0] = 0.0f; o_frag[dc][1] = 0.0f;
+        o_frag[dc][2] = 0.0f; o_frag[dc][3] = 0.0f;
+    }
+
+    float m_state[2] = {-INFINITY, -INFINITY};
+    float l_state[2] = {0.0f, 0.0f};
+
+    const float scale = 1.0f / sqrtf((float)D4);
+    int Tc = (N + BC4 - 1) / BC4;
+
+    // Each cp.async transfers exactly 16 B = 8 halves = one chunk. The
+    // destination column offset within a row is `col_in_row`, swizzled via
+    // m10_6_swizzle(row_in_tile, col_in_row). Source (gmem) is unchanged.
+    auto issue_tile = [&](int stage, int j, bool may_be_oob) {
+        constexpr int VEC_HALVES   = 8;
+        constexpr int VECS_PER_ROW = D4 / VEC_HALVES;
+        constexpr int N_TRANSFERS  = (BC4 * D4) / VEC_HALVES;
+        constexpr int PASSES       = N_TRANSFERS / M10_4_THREADS;
+
+        #pragma unroll
+        for (int p = 0; p < PASSES; ++p) {
+            int t = p * M10_4_THREADS + threadIdx.x;
+            int row_in_tile = t / VECS_PER_ROW;
+            int col_in_row  = (t % VECS_PER_ROW) * VEC_HALVES;
+            int kcol = j * BC4 + row_in_tile;
+            int src_row = may_be_oob ? ((kcol < N) ? kcol : (N - 1)) : kcol;
+
+            int col_sw = m10_6_swizzle(row_in_tile, col_in_row);
+
+            __half*       k_smem = &Ks[stage][row_in_tile * D4 + col_sw];
+            __half*       v_smem = &Vs[stage][row_in_tile * D4 + col_sw];
+            const __half* k_gmem = &K[src_row * D4 + col_in_row];
+            const __half* v_gmem = &V[src_row * D4 + col_in_row];
+
+            m10_6_cp_async_16(k_smem, k_gmem);
+            m10_6_cp_async_16(v_smem, v_gmem);
+        }
+    };
+
+    if (Tc > 0) issue_tile(0, 0, /*may_be_oob=*/(Tc == 1));
+    __pipeline_commit();
+
+    int compute_stage = 0;
+    int load_stage    = 1 % STAGES_M10_4;
+
+    for (int j = 0; j < Tc; ++j) {
+        if (j + 1 < Tc) {
+            issue_tile(load_stage, j + 1, /*may_be_oob=*/(j + 2 == Tc));
+        }
+        __pipeline_commit();
+
+        __pipeline_wait_prior(STAGES_M10_4 - 1);
+        __syncthreads();
+
+        __half* Ks_cur = Ks[compute_stage];
+        __half* Vs_cur = Vs[compute_stage];
+
+        // ---------------- S = Q · K^T (K read via swizzled __half2) ----------------
+        // K is the B operand. Lane (q,t) needs:
+        //   b0 = K rows (n*8+q), cols (kk*16 + 2t .. 2t+1)
+        //   b1 = K rows (n*8+q), cols (kk*16 + 2t+8 .. 2t+9)
+        // i.e., 2 contiguous halves at two column offsets in the same row.
+        float s_frag[N_CHUNKS_S][4];
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            s_frag[n][0] = 0.0f; s_frag[n][1] = 0.0f;
+            s_frag[n][2] = 0.0f; s_frag[n][3] = 0.0f;
+        }
+
+        #pragma unroll
+        for (int kk = 0; kk < K_CHUNKS_S; ++kk) {
+            #pragma unroll
+            for (int n = 0; n < N_CHUNKS_S; ++n) {
+                int k_row = n * 8 + q_lane;
+                int c_lo  = kk * 16 + 2 * t_lane;
+                int c_hi  = kk * 16 + 2 * t_lane + 8;
+                int s_lo  = m10_6_swizzle(k_row, c_lo);
+                int s_hi  = m10_6_swizzle(k_row, c_hi);
+                __half2 b0v = *reinterpret_cast<__half2*>(&Ks_cur[k_row * D4 + s_lo]);
+                __half2 b1v = *reinterpret_cast<__half2*>(&Ks_cur[k_row * D4 + s_hi]);
+                uint32_t b0 = pack_half2(b0v);
+                uint32_t b1 = pack_half2(b1v);
+
+                mma_m16n8k16(s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3],
+                             q_frag[kk][0], q_frag[kk][1], q_frag[kk][2], q_frag[kk][3],
+                             b0, b1,
+                             s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3]);
+            }
+        }
+
+        // ---- Scale + OOB mask ----
+        bool last_tile = (j == Tc - 1);
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            int col0 = n * 8 + 2 * t_lane;
+            int col1 = col0 + 1;
+            int kcol0 = j * BC4 + col0;
+            int kcol1 = j * BC4 + col1;
+            bool m0 = last_tile && (kcol0 >= N);
+            bool m1 = last_tile && (kcol1 >= N);
+            s_frag[n][0] = m0 ? -INFINITY : (s_frag[n][0] * scale);
+            s_frag[n][1] = m1 ? -INFINITY : (s_frag[n][1] * scale);
+            s_frag[n][2] = m0 ? -INFINITY : (s_frag[n][2] * scale);
+            s_frag[n][3] = m1 ? -INFINITY : (s_frag[n][3] * scale);
+        }
+
+        // ---- Row max ----
+        float row_max_top = -INFINITY;
+        float row_max_bot = -INFINITY;
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            row_max_top = fmaxf(row_max_top, fmaxf(s_frag[n][0], s_frag[n][1]));
+            row_max_bot = fmaxf(row_max_bot, fmaxf(s_frag[n][2], s_frag[n][3]));
+        }
+        row_max_top = fmaxf(row_max_top, __shfl_xor_sync(0xffffffff, row_max_top, 1));
+        row_max_top = fmaxf(row_max_top, __shfl_xor_sync(0xffffffff, row_max_top, 2));
+        row_max_bot = fmaxf(row_max_bot, __shfl_xor_sync(0xffffffff, row_max_bot, 1));
+        row_max_bot = fmaxf(row_max_bot, __shfl_xor_sync(0xffffffff, row_max_bot, 2));
+
+        float m_new_top = fmaxf(m_state[0], row_max_top);
+        float m_new_bot = fmaxf(m_state[1], row_max_bot);
+        float alpha_top = (m_state[0] == -INFINITY) ? 0.0f : __expf(m_state[0] - m_new_top);
+        float alpha_bot = (m_state[1] == -INFINITY) ? 0.0f : __expf(m_state[1] - m_new_bot);
+
+        #pragma unroll
+        for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+            o_frag[dc][0] *= alpha_top;
+            o_frag[dc][1] *= alpha_top;
+            o_frag[dc][2] *= alpha_bot;
+            o_frag[dc][3] *= alpha_bot;
+        }
+
+        float l_ij_top = 0.0f;
+        float l_ij_bot = 0.0f;
+        float p_vals[N_CHUNKS_S][4];
+        #pragma unroll
+        for (int n = 0; n < N_CHUNKS_S; ++n) {
+            float p0 = (s_frag[n][0] == -INFINITY) ? 0.0f : __expf(s_frag[n][0] - m_new_top);
+            float p1 = (s_frag[n][1] == -INFINITY) ? 0.0f : __expf(s_frag[n][1] - m_new_top);
+            float p2 = (s_frag[n][2] == -INFINITY) ? 0.0f : __expf(s_frag[n][2] - m_new_bot);
+            float p3 = (s_frag[n][3] == -INFINITY) ? 0.0f : __expf(s_frag[n][3] - m_new_bot);
+            p_vals[n][0] = p0; p_vals[n][1] = p1;
+            p_vals[n][2] = p2; p_vals[n][3] = p3;
+            l_ij_top += p0 + p1;
+            l_ij_bot += p2 + p3;
+        }
+        l_ij_top += __shfl_xor_sync(0xffffffff, l_ij_top, 1);
+        l_ij_top += __shfl_xor_sync(0xffffffff, l_ij_top, 2);
+        l_ij_bot += __shfl_xor_sync(0xffffffff, l_ij_bot, 1);
+        l_ij_bot += __shfl_xor_sync(0xffffffff, l_ij_bot, 2);
+
+        l_state[0] = alpha_top * l_state[0] + l_ij_top;
+        l_state[1] = alpha_bot * l_state[1] + l_ij_bot;
+        m_state[0] = m_new_top;
+        m_state[1] = m_new_bot;
+
+        // ---- Repack P into A-fragment layout (same as M10.4/10.5) ----
+        uint32_t p_frag[P_CHUNKS][4];
+        #pragma unroll
+        for (int pc = 0; pc < P_CHUNKS; ++pc) {
+            int n0 = 2 * pc;
+            int n1 = 2 * pc + 1;
+            p_frag[pc][0] = pack_halves(__float2half(p_vals[n0][0]), __float2half(p_vals[n0][1]));
+            p_frag[pc][1] = pack_halves(__float2half(p_vals[n0][2]), __float2half(p_vals[n0][3]));
+            p_frag[pc][2] = pack_halves(__float2half(p_vals[n1][0]), __float2half(p_vals[n1][1]));
+            p_frag[pc][3] = pack_halves(__float2half(p_vals[n1][2]), __float2half(p_vals[n1][3]));
+        }
+
+        // ---------------- O += P · V via ldmatrix.x2.trans on swizzled V ----
+        // ldmatrix.x2.trans, lane L (0..15) provides a row pointer to V row
+        // (pc*16 + L) at logical column origin (dc*8). With swizzle, lane L's
+        // pointer is &Vs[row * D + swizzle(row, dc*8)]. The hardware reads 8
+        // halves from each lane (= one chunk = logical cols [dc*8 .. dc*8+7]),
+        // then transposes the two 8×8 tiles into b0/b1 in the m16n8k16 B layout.
+        //
+        // Bank-conflict picture: lanes 0..7 hit 8 *distinct* chunks (because the
+        // swizzle XORs by row&7 which cycles 0..7 across those 8 lanes); lanes
+        // 8..15 hit the same set of 8 chunks (rows 8..15 mod 8 = 0..7). Net:
+        // 2-way conflict instead of 16-way.
+        int v_lane = lane & 15;
+        #pragma unroll
+        for (int pc = 0; pc < P_CHUNKS; ++pc) {
+            int v_row = pc * 16 + v_lane;
+            #pragma unroll
+            for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+                int col_base = dc * 8;
+                int col_sw   = m10_6_swizzle(v_row, col_base);
+                const __half* row_addr = &Vs_cur[v_row * D4 + col_sw];
+                uint32_t smem_int = __cvta_generic_to_shared(row_addr);
+                uint32_t b0, b1;
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
+                    : "=r"(b0), "=r"(b1)
+                    :  "r"(smem_int));
+
+                mma_m16n8k16(o_frag[dc][0], o_frag[dc][1], o_frag[dc][2], o_frag[dc][3],
+                             p_frag[pc][0], p_frag[pc][1], p_frag[pc][2], p_frag[pc][3],
+                             b0, b1,
+                             o_frag[dc][0], o_frag[dc][1], o_frag[dc][2], o_frag[dc][3]);
+            }
+        }
+
+        __syncthreads();
+
+        compute_stage = (compute_stage + 1) % STAGES_M10_4;
+        load_stage    = (load_stage    + 1) % STAGES_M10_4;
+    }
+
+    // ---- Normalize and write O ----
+    float inv_l_top = (l_state[0] > 0.0f) ? (1.0f / l_state[0]) : 0.0f;
+    float inv_l_bot = (l_state[1] > 0.0f) ? (1.0f / l_state[1]) : 0.0f;
+
+    #pragma unroll
+    for (int dc = 0; dc < D_CHUNKS_O; ++dc) {
+        int col0 = dc * 8 + 2 * t_lane;
+        int col1 = col0 + 1;
+        if (row_top < N) {
+            O[row_top * D4 + col0] = o_frag[dc][0] * inv_l_top;
+            O[row_top * D4 + col1] = o_frag[dc][1] * inv_l_top;
+        }
+        if (row_bot < N) {
+            O[row_bot * D4 + col0] = o_frag[dc][2] * inv_l_bot;
+            O[row_bot * D4 + col1] = o_frag[dc][3] * inv_l_bot;
+        }
+    }
+}
+
+inline void launch_flash_mma_swizzled(const __half* Q, const __half* K, const __half* V,
+                                      float* O, int N) {
+    dim3 block(M10_4_THREADS);
+    dim3 grid((N + BR4_BLOCK - 1) / BR4_BLOCK);
+    flash_attention_mma_swizzled<<<grid, block>>>(Q, K, V, O, N);
+}
+
+// ============================================================================
 // Naive reference: three kernels, materialized N×N attention matrix.
 // (Single-head only — used by bench.cu for the headline comparison. Multi-head
 // references for the new variants live in solution.cu as host-side functions.)

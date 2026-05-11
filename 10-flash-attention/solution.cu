@@ -384,6 +384,48 @@ static void test_mma_ldmatrix_flash() {
     }
 }
 
+static void test_mma_swizzled_flash() {
+    std::printf("\n[1g] M10.6 mma.sync + ldmatrix + swizzled smem flash, multi-N verify (FP16 in / FP32 out)\n");
+    for (int N : {128, 1024, 2048}) {
+        std::srand(7 + N);
+        std::vector<float>  h_Q(N * D), h_K(N * D), h_V(N * D);
+        std::vector<__half> h_Qh(N * D), h_Kh(N * D), h_Vh(N * D);
+        fill_random(h_Q); fill_random(h_K); fill_random(h_V);
+        for (int i = 0; i < N * D; ++i) {
+            h_Qh[i] = __float2half(h_Q[i]); h_Q[i] = __half2float(h_Qh[i]);
+            h_Kh[i] = __float2half(h_K[i]); h_K[i] = __half2float(h_Kh[i]);
+            h_Vh[i] = __float2half(h_V[i]); h_V[i] = __half2float(h_Vh[i]);
+        }
+
+        std::vector<float> h_ref(N * D);
+        host_attention(h_Q.data(), h_K.data(), h_V.data(), h_ref.data(), N);
+
+        __half *d_Q, *d_K, *d_V;
+        float  *d_O;
+        CUDA_CHECK(cudaMalloc(&d_Q, N * D * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_K, N * D * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_V, N * D * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_O, N * D * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_Q, h_Qh.data(), N * D * sizeof(__half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_K, h_Kh.data(), N * D * sizeof(__half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_V, h_Vh.data(), N * D * sizeof(__half), cudaMemcpyHostToDevice));
+
+        launch_flash_mma_swizzled(d_Q, d_K, d_V, d_O, N);
+        CUDA_CHECK_LAST();
+
+        std::vector<float> h_got(N * D);
+        CUDA_CHECK(cudaMemcpy(h_got.data(), d_O, N * D * sizeof(float), cudaMemcpyDeviceToHost));
+        char name[64];
+        std::snprintf(name, sizeof(name), "    N=%-5d 10.6 mma+ldmatrix+swizzle flash", N);
+        check(h_got, h_ref, name, /*rel*/2e-2f, /*abs*/5e-3f);
+
+        CUDA_CHECK(cudaFree(d_Q));
+        CUDA_CHECK(cudaFree(d_K));
+        CUDA_CHECK(cudaFree(d_V));
+        CUDA_CHECK(cudaFree(d_O));
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Test 2: multi-head FA. B=2, H=4, N=128, D=64.
 // ----------------------------------------------------------------------------
@@ -573,6 +615,7 @@ int main() {
     test_async_wmma_flash();
     test_mma_flash();
     test_mma_ldmatrix_flash();
+    test_mma_swizzled_flash();
     test_mha();
     test_causal();
     test_kvcache();

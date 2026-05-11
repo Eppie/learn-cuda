@@ -162,11 +162,13 @@ three working kernels and a stretch spec:
 | 10.3   | `flash_attention_async_wmma`    | FP16     | WMMA + cp.async ×2  | 28 TF/s         |
 | 10.4   | `flash_attention_mma`           | FP16     | raw `mma.sync` + cp.async | 62 TF/s   |
 | 10.5   | `flash_attention_mma_ldmatrix`  | FP16     | `mma.sync` + `ldmatrix` fragment loads | 61 TF/s |
+| 10.6   | `flash_attention_mma_swizzled`  | FP16     | `mma.sync` + `ldmatrix` + XOR-swizzled smem | 90 TF/s |
 
 (Numbers are min-of-N timing on RTX 4090, single head, D=64; see
-`bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.4/10.5 are
-at ~37% of peak. The 10.5 vs 10.4 result — essentially tied — is itself a
-finding; see §11.)
+`bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.6 is at
+~56% of peak — and beats production-grade FA-2 / CUTLASS-shape kernels at the
+low end of their typical range. The 10.5 vs 10.4 result — essentially tied —
+is the diagnostic that motivates 10.6; see §§11–12.)
 
 **Roofline at this exact shape:** the compute ceiling for FP16-in / FP32-acc
 on RTX 4090 is ~165 TF/s; cuBLAS run as two separate hgemms (QK^T then PV)
@@ -502,8 +504,7 @@ tiles when writing them to shared: each row's column indices XOR'd with
 a function of the row index, so a column-major read across rows hits
 different banks per lane. That's the change CUTLASS makes; it's a
 non-trivial rewrite of the `cp.async` `issue_tile` lambda and of the
-ldmatrix pointer math. Worth doing in a hypothetical 10.6; out of scope
-here.
+ldmatrix pointer math. We do exactly this in 10.6 (§12).
 
 **Pedagogical takeaway.** Use `ldmatrix` to feed `mma.sync` — that's the
 production idiom. But don't expect it to be a free win on its own;
@@ -511,14 +512,101 @@ without swizzled smem, you're trading the instruction-count cost for
 the same conflict-cost as the manual path. The win compounds with
 swizzle, and only with swizzle.
 
-## 12. The four shape variants
+## 12. Rung 10.6 — XOR-swizzled shared memory
+
+```c
+// kernels.cuh, flash_attention_mma_swizzled()
+// Same shape, same mma.sync, same ldmatrix instructions as 10.5.
+// Only the shared-memory layout for Q, K, and V changes.
+```
+
+10.5 measured a real disappointment: `ldmatrix` cut the instruction count from
+64 LDS to 20 LDSM, but the bench was a wash (~61 TF/s vs 10.4's ~62). The
+profiler confirmed why: on the *unswizzled* row-major layout, the V-side
+`ldmatrix.x2.trans` instruction asks 16 lanes for pointers to 16 different
+rows at the **same** column offset, and 128-byte rows in shared map straight
+onto 32 banks — a 16-way conflict. The hardware's transposing wires save
+instruction count but not memory-system throughput.
+
+The fix is to permute the column indices when *writing* to shared (in
+`cp.async`) and *reading* from shared (in `ldmatrix` / packed `__half2`
+loads), so the same column-offset across different rows lands on different
+banks.
+
+**The XOR swizzle.** For an element logically at `(row, col)` in a tile, we
+store it at column `swizzle(row, col)` in the same row:
+
+```
+chunk        = col >> 3                       // 16-byte chunk index (0..7)
+chunk_swizz  = chunk ^ (row & 7)
+col_swizz    = (col & 7) | (chunk_swizz << 3)
+```
+
+The swizzle is **a bijection on 8-half chunks** that depends on `row & 7`.
+Two key properties:
+
+1. *8-half alignment is preserved.* If `col` is 8-aligned, so is
+   `swizzle(row, col)`. So a `cp.async` of 16 bytes (= 8 halves = 1 chunk)
+   from `gmem` row-major lands at exactly one chunk-slot in `smem`, and an
+   `ldmatrix` pointer that reads 8 contiguous halves picks up the original
+   logical 8-element block.
+2. *Within any window of 8 consecutive rows, the chunks form a permutation
+   of `0..7`.* So an `ldmatrix.x2.trans` asking 16 lanes for rows
+   `r, r+1, ..., r+15` all at the same column origin hits each bank-group
+   exactly twice — 2-way conflict instead of 16-way.
+
+**Application.** We swizzle on the way *in* (the `cp.async` `issue_tile`
+lambda computes `col_sw = swizzle(row_in_tile, col_in_row)` for the
+destination) and on the way *out* (every `ldmatrix` and `__half2` read
+recomputes the swizzled column for its row pointer).
+
+**Q is also swizzled** for layout uniformity. The kernel-entry Q write goes
+out swizzled; the four `ldmatrix.x4` reads compute their swizzled column
+once and feed it to the instruction. Per-iter cost is zero.
+
+**Profiler numbers (RTX 4090, single head N=8192, D=64):**
+
+| Counter | 10.5 (unswizzled ldmatrix) | 10.6 (swizzled) |
+|---|---|---|
+| `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` | 3,684,352 | **0** |
+| `l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum`    | 4,210,688 | **526,336** |
+
+Bank conflicts go from ~87% of wavefronts to **zero**, and the wavefront
+count itself drops 8× because conflict-replays count as separate wavefronts.
+
+**Verification.** Identical `max_abs` to 10.4/10.5 at every N: 3.80e-5 /
+1.71e-5 / 1.26e-5 at N ∈ {128, 1024, 2048}. Bit-equivalent output;
+`compute-sanitizer memcheck/synccheck/racecheck` clean.
+
+**Bench result.** This is the win the optimization ladder was building toward:
+
+| Rung | N=2048 | N=4096 | N=8192 |
+|---|---:|---:|---:|
+| 10.4 raw mma.sync         | 13.8 TF/s | 28.7 TF/s | 61.0 TF/s |
+| 10.5 +ldmatrix            | 13.8 TF/s | 28.2 TF/s | 59.5 TF/s |
+| **10.6 +swizzle**         | **20.6 TF/s** | **42.4 TF/s** | **89.7 TF/s** |
+
+At N=8192 that's **+47% over 10.4** and **+51% over 10.5**, putting us at
+~56% of the cuBLAS hgemm peak (~159 TF/s) and *inside* the band where real
+production FA-2 / CUTLASS-shape kernels land (80–130 TF/s on this card).
+The two stages of the M10.5/10.6 split — instruction count first, then bank
+conflicts — were each necessary; together they compound.
+
+**Pedagogical takeaway.** Shared-memory bank conflicts on a tensor-core path
+are a *layout* problem, not an *instruction* problem. `ldmatrix` alone gives
+you the right SASS; the swizzle gives you the right traffic. CUTLASS's XOR
+swizzle is the same shape used everywhere from `Sm80_K64` GEMM kernels to
+production FA-2: 3 ALU ops per address computation, zero extra storage, and
+it removes an entire class of conflicts deterministically.
+
+## 13. The four shape variants
 
 Each of these is a thin overlay on the §3 loop. They're all written on top of
 the simple "one thread per Q row" base (10.0) because the shape concern is
 independent of the speed concern, and because reading them next to the base
 is the clearest way to see exactly what's added.
 
-### 12.A Causal masking with tile-skip
+### 13.A Causal masking with tile-skip
 
 For autoregressive (GPT-style) models the score matrix is lower-triangular:
 `S[i, j] = -∞ if j > i`. The naive way is to apply the mask per-element inside
@@ -536,7 +624,7 @@ below the diagonal need no mask at all.
 
 See `flash_attention_causal` in `kernels.cuh`.
 
-### 12.B KV-cache (the inference-time form of FA)
+### 13.B KV-cache (the inference-time form of FA)
 
 At inference, after the prefill phase the model processes one new token at a
 time. Each step:
@@ -556,7 +644,7 @@ total wall-clock at scale. Real implementations split it further by the
 "paged" attention pattern (vLLM); we're showing the contiguous-cache form for
 clarity.
 
-### 12.C Grouped-Query Attention (GQA)
+### 13.C Grouped-Query Attention (GQA)
 
 Llama-2/3, Mistral, and most modern open-weight inference models use GQA: the
 number of query heads `H_q` is larger than the number of KV heads `H_kv`,
@@ -571,7 +659,7 @@ practice.
 Algorithmically GQA is identical to MHA — just a different head-index
 mapping. See `flash_attention_gqa` in `kernels.cuh`.
 
-### 12.D What about porting these to 10.2 (WMMA)?
+### 13.D What about porting these to 10.2 (WMMA)?
 
 Mechanical, not free. The MHA wrapper is one extra index calculation at the
 top of the kernel — straightforward. Causal needs the tile-skip *and* a
@@ -580,7 +668,7 @@ per-tile mask: at WMMA granularity that means clobbering specific cells of
 cleanly into the existing dance. KV-cache and GQA are also pure index
 remapping. Recommended as the stretch exercise.
 
-## 13. Comparison: naive vs flash, and the ladder
+## 14. Comparison: naive vs flash, and the ladder
 
 `bench.cu` runs all rungs at `N ∈ {2048, 4096, 8192}, D = 64`:
 
@@ -593,6 +681,7 @@ remapping. Recommended as the stretch exercise.
 | 10.3 flash     | 10.2 + double-buffered cp.async K/V loads         | no             | 1 |
 | 10.4 flash     | raw `mma.sync` + register-resident softmax        | no             | 1 |
 | 10.5 flash     | 10.4 + `ldmatrix` fragment loads (Q `.x4`, V `.x2.trans`) | no    | 1 |
+| 10.6 flash     | 10.5 + XOR-swizzled smem layout for Q/K/V         | no             | 1 |
 
 At small N (2048) the naive version's S/P matrices fit in L2 (17 MB) and the
 wall-clock gap to flash is small. At `N = 8192` (256 MB S/P), naive blows out
@@ -628,6 +717,13 @@ applied to the *same* algorithm:
   bank-column across rows whether the load is `ldmatrix.x2.trans` or
   manual. The full headline win requires `ldmatrix` *plus* a swizzled
   shared-memory layout for K/V. See §11 for the full discussion.
+- 10.5 → 10.6: **XOR-swizzled smem.** Permute the column index of each
+  16-byte chunk by `chunk ^ (row & 7)` when writing K/V/Q to shared (and
+  apply the same permutation on every read). The 16-way bank conflict on
+  the V `ldmatrix.x2.trans` collapses to 2-way, and the K `__half2` and
+  Q `ldmatrix.x4` paths go to 0-conflict. `ncu` bank-conflict counter:
+  3.68M → 0. ~1.5× over 10.5 at N=8192 — the headline FA-2/CUTLASS
+  win that 10.5 was missing. See §12.
 
 ---
 
@@ -654,18 +750,19 @@ each runs a host-side reference at small sizes (B=2, H=4, N=128, D=64).
   more of the K/V load latency. See M08 §3a for the deeper-pipeline pattern.
 - **Port the four shape variants to WMMA or mma.sync.** Take `flash_attention_wmma`
   (or `flash_attention_mma`) and add the MHA / causal / KV-cache / GQA overlays
-  from §12. Causal at WMMA granularity is the most interesting because the
+  from §13. Causal at WMMA granularity is the most interesting because the
   per-tile mask now applies to the materialized `Ssm` between
   `store_matrix_sync` and the row-softmax step. At raw `mma.sync` granularity,
   the mask is a per-lane register guard right after Q·Kᵀ — even cleaner.
-- **Swizzled shared memory for 10.5.** 10.5 swaps the manual fragment loads
-  for `ldmatrix` (`.x4` for Q, `.x2.trans` for V) but lands at the same
-  TF/s as 10.4 because the V transposed load still bank-conflicts with
-  row-major K/V in shared. The CUTLASS-style fix is to XOR-swizzle the
-  column index when writing K/V to shared (so a transposed read across
-  rows hits 16 different banks per lane). The `ldmatrix` pointer math
-  needs the same swizzle applied — straightforward but tedious. This
-  is the missing +10-15% on top of 10.5 on this card.
+- **STAGES=3 cp.async for 10.6.** 10.6 still runs the same 2-stage
+  pipeline as 10.4/10.5. With `cudaFuncSetAttribute(.., cudaFuncAttribute­
+  MaxDynamicSharedMemorySize, ..)` the 100 KB-per-block budget on sm_89
+  fits a third K/V tile, which should hide a bit more cp.async latency.
+- **Register-resident Q across the outer loop.** 10.6 reloads Q from
+  shared once at kernel entry. With a small register-pressure increase
+  the four Q fragments could live in registers for the full lifetime
+  of the kernel, freeing shared-memory wavefronts and improving
+  occupancy.
 - **FlashAttention-2 loop swap.** Swap the loop order so the outer loop is
   over the K/V tile and the inner is over the Q rows. The state machine
   becomes per-output-block instead of per-Q-row. ~2× faster than v1 in
