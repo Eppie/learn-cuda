@@ -163,12 +163,14 @@ three working kernels and a stretch spec:
 | 10.4   | `flash_attention_mma`           | FP16     | raw `mma.sync` + cp.async | 62 TF/s   |
 | 10.5   | `flash_attention_mma_ldmatrix`  | FP16     | `mma.sync` + `ldmatrix` fragment loads | 61 TF/s |
 | 10.6   | `flash_attention_mma_swizzled`  | FP16     | `mma.sync` + `ldmatrix` + XOR-swizzled smem | 90 TF/s |
+| 10.7   | `flash_attention_mma_fa2`       | FP16     | 10.6 + STAGES=3 + K-via-ldmatrix + Q-overlay | 100 TF/s |
 
 (Numbers are min-of-N timing on RTX 4090, single head, D=64; see
-`bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.6 is at
-~56% of peak — and beats production-grade FA-2 / CUTLASS-shape kernels at the
-low end of their typical range. The 10.5 vs 10.4 result — essentially tied —
-is the diagnostic that motivates 10.6; see §§11–12.)
+`bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.7 is at
+~60% of peak — and lands solidly inside the production FA-2 / CUTLASS-shape
+band on this card. The 10.5 vs 10.4 result — essentially tied — is the
+diagnostic that motivates 10.6; see §§11–12. The +10% step from 10.6 to 10.7
+stacks three FA-2-shape levers with a shared-memory overlay; see §13.)
 
 **Roofline at this exact shape:** the compute ceiling for FP16-in / FP32-acc
 on RTX 4090 is ~165 TF/s; cuBLAS run as two separate hgemms (QK^T then PV)
@@ -599,14 +601,152 @@ swizzle is the same shape used everywhere from `Sm80_K64` GEMM kernels to
 production FA-2: 3 ALU ops per address computation, zero extra storage, and
 it removes an entire class of conflicts deterministically.
 
-## 13. The four shape variants
+## 13. Rung 10.7 — FlashAttention-2-shape kernel
+
+```c
+// kernels.cuh, flash_attention_mma_fa2()
+// Same tile shape, mma.sync, and swizzled smem as M10.6. Three FA-2 levers
+// stacked: STAGES=3 cp.async, K via ldmatrix.x4 (no .trans), and a
+// Q-shared-memory overlay that lets us keep STAGES=3 *without* losing the
+// 4-blocks-per-SM occupancy M10.6 enjoyed.
+```
+
+10.6 landed at **89.7 TF/s** — comfortably inside the production FA-2 band
+(80–130 TF/s on RTX 4090) but only 54% of the 165 TF/s compute roofline. The
+remaining levers from production-grade FA-2 are: (1) Q register-resident
+across K-tile iters (already done in 10.6), (2) deeper cp.async pipeline,
+(3) `ldmatrix` for K loads. We stack levers (2) and (3) on a fourth
+optimization — a shared-memory overlay — that preserves occupancy.
+
+### 13.1 Lever 1 (already harvested at 10.6): Q register-resident
+
+10.6 hoists the `ldmatrix.x4` Q loads *out of* the main K-tile loop:
+`q_frag[K_CHUNKS_S][4]` is computed once at kernel entry and reused across
+every K-tile iter. Per-iter Q-load traffic is zero. No code change at 10.7.
+
+### 13.2 Lever 2: `STAGES=3` cp.async
+
+10.6 double-buffers K and V (`STAGES=2`). 10.7 goes to three stages, so the
+compute can run two K-tiles behind the loads in flight. The orchestration is
+the same shape as `gemm_v1_async` with `STAGES=3` in `08-async-copy`:
+
+- Prologue issues `STAGES-1 = 2` `__pipeline_commit()`s ahead of the loop.
+- Main loop's `__pipeline_wait_prior(STAGES-1)` becomes `wait_prior(2)`.
+- The new tile issued in iter `j` goes into stage `(j + STAGES - 1) % STAGES`.
+
+### 13.3 Lever 3: `ldmatrix` for K
+
+10.6 loads K's B-fragment with two manual `__half2` reads per lane per
+`(kk, n)` mma — 16 mmas × 2 loads = 32 LDS.32 per K tile.
+
+Here's the trick: **K-as-B is naturally col-major**. K's shared layout has
+the d-axis fast, and the d-axis is precisely the K-dim of mma's B operand;
+mma's `.col` convention means K-dim fast. So K does *not* need the `.trans`
+variant of `ldmatrix` (unlike V, where the K-dim of mma — `v_row` — is
+slow in storage and `.trans` is required).
+
+That lets us use **`ldmatrix.x4` (no .trans)** to load a 16×16 K sub-tile,
+and the resulting A-fragment layout maps directly onto the B-fragments of
+*two consecutive* `(kk, n)` and `(kk, n+1)` mmas. With `M = K_tile[n2*16 ..
+n2*16+15, kk*16 .. kk*16+15]`:
+
+```
+a0 = M[g,   2t..2t+1]   = K_tile[n2*16+g,   kk*16+2t..]   = b0 for (kk, 2n2)
+a1 = M[g+8, 2t..2t+1]   = K_tile[n2*16+g+8, kk*16+2t..]   = b0 for (kk, 2n2+1)
+a2 = M[g,   2t+8..2t+9] = K_tile[n2*16+g,   kk*16+2t+8..] = b1 for (kk, 2n2)
+a3 = M[g+8, 2t+8..2t+9] = K_tile[n2*16+g+8, kk*16+2t+8..] = b1 for (kk, 2n2+1)
+```
+
+So 8 `ldmatrix.x4` per K-tile (K_CHUNKS_S=4 × 2 n-pairs each) replaces 32
+manual `LDS.32` per lane. Same swizzle pattern as Q/V on the row pointer.
+
+### 13.4 The Q/K/V shared-memory overlay (the unblocker)
+
+Naively, going from `STAGES=2` (24 KB per block: Q=8, K×2=8, V×2=8) to
+`STAGES=3` (32 KB: Q=8, K×3=12, V×3=12) costs an occupancy slot — sm_89 has
+100 KB shared per SM, so 24 KB→4 blocks but 32 KB→3 blocks. M10.6 ran at 4
+blocks/SM; M10.7 at the naive layout would run at 3.
+
+Observation: **Q is dead after the kernel-entry ldmatrix loads.** It's
+written into shared, copied into `q_frag` registers, and then never read
+again. So we can union Q's 8 KB buffer with stage 0 of K and V (4 KB each =
+8 KB total), saving exactly the 8 KB that going from STAGES=2 to STAGES=3
+adds for K/V together. Result: 24 KB shared per block, **4 blocks/SM**.
+
+```c
+// Q (8 KB) lives at offset 0 of an 8-KB overlay buffer.
+// After Q→regs + __syncthreads, the same 8 KB hosts K[0] (offset 0) and
+// V[0] (offset BC4*D4). K[1..2] and V[1..2] live in separate 4-KB slots.
+static_assert(WARPS_M10_4 * BR4 * D4 == 2 * BC4 * D4, ...);
+__shared__ __half KsVs_overlay[2 * BC4 * D4];           // Q | K[0] | V[0]
+__shared__ __half Ks_rest[STAGES - 1][BC4 * D4];        // K[1..STAGES-1]
+__shared__ __half Vs_rest[STAGES - 1][BC4 * D4];        // V[1..STAGES-1]
+```
+
+The block-wide `__syncthreads()` between Q ldmatrix and the cp.async
+prologue is now load-bearing — without it, a different warp could start
+cp.async into K[0] while another warp's Q ldmatrix from the same bytes is
+still in flight.
+
+### 13.5 The `cudaFuncSetAttribute` ritual
+
+On sm_89 the per-block dynamic-shared limit defaults to 48 KB.
+`cudaFuncAttributeMaxDynamicSharedMemorySize` raises it (max 99 KB on sm_89).
+**On sm_89, that same attribute also gates static shared above 48 KB.** We
+set it to 64 KB in `launch_flash_mma_fa2` defensively — our static footprint
+is 24 KB so it isn't strictly required at this configuration, but the call
+documents the FA-2 pattern (any kernel pushing STAGES higher or BC4 wider
+*will* need it).
+
+### 13.6 Numbers
+
+Single head, D=64, RTX 4090, min-of-10 timing. Median across 5 bench runs.
+
+| Rung | N=2048 | N=4096 | N=8192 |
+|---|---:|---:|---:|
+| 10.6 mma + ldmatrix + swizzle | 21.85 TF/s | 44.74 TF/s | 91.18 TF/s |
+| **10.7 FA-2-shape** | **23.30 TF/s** | **48.93 TF/s** | **99.86 TF/s** |
+| Δ vs 10.6                     | +6.6% | +9.4% | +9.5% |
+
+At N=8192 that's **~60% of the 165 TF/s compute roofline** and right at the
+production FA-2 / CUTLASS-shape midline (80–130 TF/s on this card).
+`compute-sanitizer memcheck/synccheck/racecheck` — all clean on the M10.7
+kernel (the only racecheck hazards reported are in the unrelated
+`naive_softmax` reference). `max_abs` is bit-identical to 10.4/10.5/10.6
+(3.80e-5 / 1.71e-5 / 1.26e-5 at N ∈ {128, 1024, 2048}) — all three levers
+are pure perf, zero correctness drift.
+
+### 13.7 What's left on the table
+
+The remaining gap to 130 TF/s (the *upper* end of the production FA-2 band)
+needs **warp specialization**: split the warps into a producer set that
+runs cp.async and a consumer set that runs mma + softmax, with hand-rolled
+async barriers between them. That's a structural refactor (different threads
+running different code), not another knob on the same loop, so it's
+out-of-scope for the 10.x ladder. Hopper's TMA + warp-group MMA makes this
+much cleaner; sm_89 can do it manually but the code becomes substantially
+more complex. That's where FA-2's `flash_fwd_kernel.h` and CUTLASS's
+`Sm90_K64` examples spend their last 20–30%.
+
+### 13.8 Pedagogical takeaway
+
+The three levers individually look small. Stacked, with one structural trick
+(the Q overlay) to recover the occupancy that the naive deeper-pipeline
+trade would have lost, they compose into the +10% step that lands the kernel
+solidly inside the production FA-2 band. The compute roofline isn't a
+single bottleneck to fix — it's a *budget* shared across instruction count,
+shared-memory traffic, pipeline depth, and occupancy. Production kernels
+juggle all four at once; pedagogically, separating them into 10.4 → 10.5 →
+10.6 → 10.7 shows you which knobs cost what.
+
+## 14. The four shape variants
 
 Each of these is a thin overlay on the §3 loop. They're all written on top of
 the simple "one thread per Q row" base (10.0) because the shape concern is
 independent of the speed concern, and because reading them next to the base
 is the clearest way to see exactly what's added.
 
-### 13.A Causal masking with tile-skip
+### 14.A Causal masking with tile-skip
 
 For autoregressive (GPT-style) models the score matrix is lower-triangular:
 `S[i, j] = -∞ if j > i`. The naive way is to apply the mask per-element inside
@@ -624,7 +764,7 @@ below the diagonal need no mask at all.
 
 See `flash_attention_causal` in `kernels.cuh`.
 
-### 13.B KV-cache (the inference-time form of FA)
+### 14.B KV-cache (the inference-time form of FA)
 
 At inference, after the prefill phase the model processes one new token at a
 time. Each step:
@@ -644,7 +784,7 @@ total wall-clock at scale. Real implementations split it further by the
 "paged" attention pattern (vLLM); we're showing the contiguous-cache form for
 clarity.
 
-### 13.C Grouped-Query Attention (GQA)
+### 14.C Grouped-Query Attention (GQA)
 
 Llama-2/3, Mistral, and most modern open-weight inference models use GQA: the
 number of query heads `H_q` is larger than the number of KV heads `H_kv`,
@@ -659,7 +799,7 @@ practice.
 Algorithmically GQA is identical to MHA — just a different head-index
 mapping. See `flash_attention_gqa` in `kernels.cuh`.
 
-### 13.D What about porting these to 10.2 (WMMA)?
+### 14.D What about porting these to 10.2 (WMMA)?
 
 Mechanical, not free. The MHA wrapper is one extra index calculation at the
 top of the kernel — straightforward. Causal needs the tile-skip *and* a
@@ -668,7 +808,7 @@ per-tile mask: at WMMA granularity that means clobbering specific cells of
 cleanly into the existing dance. KV-cache and GQA are also pure index
 remapping. Recommended as the stretch exercise.
 
-## 14. Comparison: naive vs flash, and the ladder
+## 15. Comparison: naive vs flash, and the ladder
 
 `bench.cu` runs all rungs at `N ∈ {2048, 4096, 8192}, D = 64`:
 
@@ -682,6 +822,7 @@ remapping. Recommended as the stretch exercise.
 | 10.4 flash     | raw `mma.sync` + register-resident softmax        | no             | 1 |
 | 10.5 flash     | 10.4 + `ldmatrix` fragment loads (Q `.x4`, V `.x2.trans`) | no    | 1 |
 | 10.6 flash     | 10.5 + XOR-swizzled smem layout for Q/K/V         | no             | 1 |
+| 10.7 flash     | 10.6 + STAGES=3 + K via `ldmatrix.x4` + Q-shared-overlay  | no    | 1 |
 
 At small N (2048) the naive version's S/P matrices fit in L2 (17 MB) and the
 wall-clock gap to flash is small. At `N = 8192` (256 MB S/P), naive blows out
@@ -724,6 +865,15 @@ applied to the *same* algorithm:
   Q `ldmatrix.x4` paths go to 0-conflict. `ncu` bank-conflict counter:
   3.68M → 0. ~1.5× over 10.5 at N=8192 — the headline FA-2/CUTLASS
   win that 10.5 was missing. See §12.
+- 10.6 → 10.7: **FA-2-shape: stack three more levers.** STAGES=3 cp.async
+  pipeline (deeper latency hiding), K loaded via `ldmatrix.x4` (no
+  `.trans`, since K-as-B is naturally col-major), and a Q-shared-memory
+  overlay that reclaims the 4-blocks-per-SM occupancy the deeper pipeline
+  would otherwise cost. ~+10% over 10.6 at N=8192, ~60% of the 165 TF/s
+  compute roofline, solidly inside the production FA-2 band (80–130 TF/s
+  on this card). See §13. The remaining gap to the top of the band needs
+  *warp specialization* — explicit producer/consumer warps with hand-rolled
+  async barriers — which is structural enough to be out-of-scope here.
 
 ---
 

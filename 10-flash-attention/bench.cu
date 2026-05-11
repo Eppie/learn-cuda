@@ -64,11 +64,13 @@ static void run_for_size(int N) {
         auto flash_mma        = [&] { launch_flash_mma       (d_Qh, d_Kh, d_Vh, d_O, N); };
         auto flash_mma_ldm    = [&] { launch_flash_mma_ldmatrix(d_Qh, d_Kh, d_Vh, d_O, N); };
         auto flash_mma_sw     = [&] { launch_flash_mma_swizzled (d_Qh, d_Kh, d_Vh, d_O, N); };
+        auto flash_mma_fa2    = [&] { launch_flash_mma_fa2      (d_Qh, d_Kh, d_Vh, d_O, N); };
         report("10.2 flash WMMA (fp16 in)",        bench(flash_wmma));
         report("10.3 flash cp.async + WMMA",       bench(flash_async_wmma));
         report("10.4 flash raw mma.sync",          bench(flash_mma));
         report("10.5 flash mma.sync + ldmatrix",   bench(flash_mma_ldm));
         report("10.6 flash mma+ldmatrix+swizzle",  bench(flash_mma_sw));
+        report("10.7 flash FA-2-shape (stages=3)", bench(flash_mma_fa2));
         CUDA_CHECK(cudaFree(d_Qh));
         CUDA_CHECK(cudaFree(d_Kh));
         CUDA_CHECK(cudaFree(d_Vh));

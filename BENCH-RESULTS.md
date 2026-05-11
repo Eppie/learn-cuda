@@ -194,25 +194,35 @@ Online softmax at 1008 GB/s = peak DRAM. Fused softmax beats unfused by 2.2×. G
 
 ## M10 — FlashAttention optimization ladder (D=64, single-head)
 
-| N | naive | 10.0 thread/row | 10.1 warp-coop | 10.2 WMMA | 10.3 +cp.async | 10.4 mma.sync | 10.5 +ldmatrix | **10.6 +swizzle** |
-|---|---|---|---|---|---|---|---|---|
-| 2048 | ~1.0 | 1.61 | 2.13 | 5.17 | 6.39 | 13.83 | 13.68 | **21.51** |
-| 4096 | ~1.0 | 3.24 | 4.32 | 10.44 | 13.03 | 28.58 | 28.34 | **44.15** |
-| 8192 | ~0.8 | 6.43 | 8.70 | 21.11 | 26.31 | 58.05 | 57.49 | **89.72** |
+| N | naive | 10.0 thread/row | 10.1 warp-coop | 10.2 WMMA | 10.3 +cp.async | 10.4 mma.sync | 10.5 +ldmatrix | 10.6 +swizzle | **10.7 FA-2** |
+|---|---|---|---|---|---|---|---|---|---|
+| 2048 | ~1.0 | 1.61 | 2.13 | 5.17 | 6.39 | 13.83 | 13.68 | 21.51 | **23.30** |
+| 4096 | ~1.0 | 3.24 | 4.32 | 10.44 | 13.03 | 28.58 | 28.34 | 44.15 | **48.93** |
+| 8192 | ~0.8 | 6.43 | 8.70 | 21.11 | 26.31 | 58.05 | 57.49 | 89.72 | **~98-100** |
 
-(TFLOPs/s, min-of-N on RTX 4090, idle GPU. Run-to-run noise at the top of
-the ladder is ~3% — N=8192 10.6 sits in the 88-92 TF/s band depending on
-host scheduler state.)
+(TFLOPs/s. Run-to-run noise at the top of the ladder is ±1.5 TF/s —
+N=8192 10.7 sits in a 97-100 TF/s band across multiple sequential runs.)
 
-**10.6's +48% jump over 10.5 vindicates the M10.5 diagnosis.** Adding the
-XOR-based shared-memory swizzle (`col_sw = (col & 7) | ((col>>3 ^ row&7) << 3)`,
-applied symmetrically to cp.async writes and ldmatrix reads) drops the
-bank-conflict count from 3.7M wavefronts to **0** — `ldmatrix` was indeed
-necessary but not sufficient without the swizzle.
+**The full 8-rung ladder at N=8192: 6.43 → 99.86 TF/s = 15.5× speedup
+over M10.0**, hitting **~60% of the 165 TF/s compute roofline**, at the
+lower-middle of the production FA-2 / CUTLASS reference range
+(80-130 TF/s on RTX 4090).
 
-The 5-rung jump from 10.0 → 10.6 is **30× speedup** at N=8192. **10.6 hits
-~54% of the 165 TF/s compute roofline**, solidly inside the production
-FA-2 / CUTLASS reference range (80–130 TF/s on RTX 4090).
+**10.7 stacks four optimizations on top of 10.6:**
+1. Q register-resident across K iters (already in 10.6; not new perf at 10.7)
+2. STAGES=3 cp.async (deeper pipeline, +5-10%)
+3. `ldmatrix` for K (replaces manual __half2, +3-7%) — but **without** `.trans`
+   because K-as-B is naturally col-major in storage (V was the case needing
+   `.trans`, not K)
+4. **Q/K/V shared-memory overlay** — Q's shared slot is reused by stage-0
+   of K and V (Q is dead after the kernel-entry ldmatrix). Keeps shared at
+   24 KB and preserves 4 blocks/SM occupancy; without this, STAGES=3 drops
+   to 3 blocks/SM and caps at ~98.7 TF/s.
+
+The remaining gap from 100 → 130 TF/s on this card requires **warp
+specialization** (FA-3-style producer/consumer warp groups with hand-rolled
+async barriers). Explicit future stretch; structurally larger than the
+M10.0-10.7 ladder's per-rung diffs.
 
 **10.0 → 10.4 = 9× speedup at N=8192.** Reaching **~37% of cuBLAS hgemm peak**
 (159 TF/s) in pedagogical code is a strong result. **10.5 = same throughput
@@ -232,7 +242,8 @@ traffic if everything streamed once. Arithmetic intensity ≈ 4300 FLOP/byte
 
 ```
                     Time      TF/s    % of 165 TF/s peak
-M10.6 +swizzle       192 µs    90       54%  ← us (current top of ladder)
+M10.7 FA-2 shape     172 µs   100       60%  ← us (current top of ladder)
+M10.6 +swizzle       192 µs    90       54%
 M10.4 raw mma.sync   296 µs    58       35%
 M10.5 +ldmatrix      299 µs    57       35%
 cuBLAS QK^T alone    284 µs    30       18%  ← skinny K=64

@@ -43,8 +43,10 @@ Modules with extra structure:
   `flash_attention_mma_ldmatrix` (10.5, +`ldmatrix` — same perf as 10.4 in
   pedagogical form: ldmatrix saves instruction count but not bank throughput),
   `flash_attention_mma_swizzled` (10.6, +XOR-swizzled K/V smem — bank
-  conflicts drop from 3.7M to 0; ~90 TF/s at N=8192 single-head, 30× over
-  M10.0, 54% of compute roofline, in the production FA-2 range).
+  conflicts drop from 3.7M to 0; ~90 TF/s at N=8192),
+  `flash_attention_mma_fa2` (10.7, +STAGES=3 cp.async + ldmatrix-for-K +
+  Q/K/V shared-overlay; ~100 TF/s, 60% of compute roofline, 15.5× over
+  M10.0; lower-middle of production FA-2 reference range on RTX 4090).
   *Shape variants on the simple base*: MHA, causal+tile-skip, KV-cache, GQA.
 - **`11-low-latency`** — multiple demo files: `bench.cu`, `events_demo.cu`,
   `persistent_demo.cu`, `ring_buffer.cu`. Module README is structured in
