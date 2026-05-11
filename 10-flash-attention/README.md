@@ -165,9 +165,16 @@ three working kernels and a stretch spec:
 
 (Numbers are min-of-N timing on RTX 4090, single head, D=64; see
 `bench.cu`. The cuBLAS hgemm peak on this card is ~159 TF/s, so 10.4/10.5 are
-at ~39% of peak — same shape as FlashAttention-2's reference forward kernel
-on this card. The 10.5 vs 10.4 result — essentially tied — is itself a
+at ~37% of peak. The 10.5 vs 10.4 result — essentially tied — is itself a
 finding; see §11.)
+
+**Roofline at this exact shape:** the compute ceiling for FP16-in / FP32-acc
+on RTX 4090 is ~165 TF/s; cuBLAS run as two separate hgemms (QK^T then PV)
+only hits ~39 TF/s combined at our skinny K=64, so **our fused 10.4 beats the
+cuBLAS-split baseline by 1.5×**. Production FA-2 / CUTLASS-shape kernels on
+this card land at ~80-130 TF/s. The roofline tool (`make roofline-run`)
+reproduces the cuBLAS reference numbers; full breakdown in
+[`BENCH-RESULTS.md`](../BENCH-RESULTS.md) under "Roofline reference".
 
 ### 5.1 The four shape variants
 

@@ -12,3 +12,11 @@ all: $(BINS)
 
 clean:
 	rm -f $(BINS)
+
+# Roofline reference (cuBLAS hgemm at the bench's exact shape).
+roofline: roofline.cu
+	$(NVCC) $(NVCCFLAGS) -o $@ $< -lcublas
+
+.PHONY: roofline-run
+roofline-run: roofline
+	./roofline

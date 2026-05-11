@@ -216,7 +216,49 @@ the next rung (M10.6, currently a documented stretch).
 
 **10.0 → 10.4 = 9× speedup at N=8192.** Reaching **~37% of cuBLAS hgemm peak**
 (159 TF/s) in pedagogical code is a strong result. **10.5 = same throughput
-but different SASS** — see the bank-throughput discussion above. The remaining gap is
+but different SASS** — see the bank-throughput discussion above.
+
+### Roofline reference (single-head, D=64)
+
+The full picture, comparing M10's flash kernels to (a) what cuBLAS achieves
+on the underlying matmuls at our exact shape, and (b) the analytic compute
+roofline. Run `make -C 10-flash-attention roofline-run` to reproduce.
+
+**RTX 4090 specs:** ~165 TF/s FP16-in / FP32-acc tensor-core peak, 1008 GB/s DRAM.
+
+**Workload at N=8192:** 17.18 GFLOPs (counted as 4·N²·D); ~4 MB of Q/K/V/O
+traffic if everything streamed once. Arithmetic intensity ≈ 4300 FLOP/byte
+→ **firmly compute-bound** (roofline crossover at ~164 FLOP/byte).
+
+```
+                    Time      TF/s    % of 165 TF/s peak
+M10.4 raw mma.sync   296 µs    58       35%  ← us
+M10.5 +ldmatrix      299 µs    57       35%  ← us
+cuBLAS QK^T alone    284 µs    30       18%  ← skinny K=64
+cuBLAS PV alone      156 µs    55       33%
+cuBLAS split sum     440 µs    39       24%  ← naive baseline
+Compute roofline     104 µs   165      100%  ← unreachable in practice
+```
+
+**We beat cuBLAS-split by 1.5×.** The fused flash kernel wins because (a)
+cuBLAS isn't well-tuned for K=64 ("skinny K"), and (b) we never materialize
+the N×N S/P matrix to DRAM. cuBLAS itself hits only 18-33% of its own
+tensor peak on this shape; the gap between "what cuBLAS does on a
+cube-shaped GEMM" and "what cuBLAS does on our skinny shape" is real.
+
+**Where the remaining gap to roofline goes** (the 2.85× factor between our
+58 TF/s and the 165 TF/s ceiling): online softmax overhead (the per-iter
+row-max + row-sum reductions aren't counted in FLOPs but burn real time),
+shared-memory bank conflicts on the V load (M10.5's lesson), STAGES=2
+pipeline not fully hiding compute behind loads, and lack of the
+register-blocked Q residency that CUTLASS-shape kernels use.
+
+**Production FA-2 / CUTLASS reference:** the official FlashAttention-2
+forward at this shape on Ada hits ~80-130 TF/s (50-80% of tensor peak) in
+its best configurations. Our 58 TF/s in pedagogical code is ~50-70% of
+that production target. The documented next steps (M10.6 swizzled smem +
+ldmatrix; STAGES=3 cp.async; register-resident Q across iterations) are
+where the gap closes. The remaining gap is
 CUTLASS-quality scheduling, more aggressive `ldmatrix` usage (A12 used manual
 `__half2` packing for clarity; `ldmatrix.x2.trans` for the V-as-B load would
 recover ~10-15%), and deeper pipelining (STAGES=3/4 needs
