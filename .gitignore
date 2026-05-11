@@ -20,6 +20,7 @@ mma_sync_example
 ldmatrix_example
 clock_microbench
 bar_sync_example
+roofline
 
 # CUDA build artifacts
 *.o
