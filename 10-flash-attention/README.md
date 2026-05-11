@@ -716,17 +716,49 @@ kernel (the only racecheck hazards reported are in the unrelated
 (3.80e-5 / 1.71e-5 / 1.26e-5 at N ∈ {128, 1024, 2048}) — all three levers
 are pure perf, zero correctness drift.
 
-### 13.7 What's left on the table
+### 13.7 What's left on the table — and FlashAttention-3
 
-The remaining gap to 130 TF/s (the *upper* end of the production FA-2 band)
-needs **warp specialization**: split the warps into a producer set that
-runs cp.async and a consumer set that runs mma + softmax, with hand-rolled
-async barriers between them. That's a structural refactor (different threads
-running different code), not another knob on the same loop, so it's
-out-of-scope for the 10.x ladder. Hopper's TMA + warp-group MMA makes this
-much cleaner; sm_89 can do it manually but the code becomes substantially
-more complex. That's where FA-2's `flash_fwd_kernel.h` and CUTLASS's
-`Sm90_K64` examples spend their last 20–30%.
+The remaining gap to 130 TF/s (the *upper* end of the production FA-2 band
+on RTX 4090) needs **warp specialization**: split the warps into a producer
+set that runs `cp.async` and a consumer set that runs `mma` + softmax, with
+hand-rolled async barriers between them. That's a structural refactor
+(different threads running different code), not another knob on the same
+loop, so it's out-of-scope for the 10.x ladder.
+
+#### And FA-3 (Hopper)
+
+**FlashAttention-3** (Dao et al., 2024) takes the same algorithmic ideas
+several steps further on Hopper hardware:
+
+| | FA-2 on H100 | FA-3 on H100 |
+|---|---|---|
+| FP16 forward | ~550 TF/s (55% peak) | **~740 TF/s (75% peak)** |
+| FP8 forward | n/a | ~1.2 PF/s |
+
+The extra 20 percentage points come from three Hopper-only primitives:
+
+- **WGMMA** (`wgmma.mma_async`): one warp-group (4 warps = 128 threads)
+  issues one async MMA of m64n64k16. Bigger fragments per instruction;
+  the warps go do other work while the MMA retires.
+- **TMA** (`cp.async.bulk.tensor`): descriptor-based async tensor copy.
+  One PTX op per tile, hardware does all address math.
+- **Ping-pong warp-group specialization**: half the warp-groups run
+  GEMM 1 (Q·K^T) of block A while the other half run GEMM 2 (P·V) of
+  block A−1. Hides softmax behind matmuls.
+
+**None of FA-3's hardware levers exist on Ada (sm_89).** On RTX 4090, our
+realistic ceiling is FA-2-shaped code at ~130 TF/s (the top of the
+production FA-2 band on this card), reachable via warp specialization
+on top of M10.7. The *algorithmic* idea of warp specialization works on
+Ada — it's just much uglier without WGMMA's async-by-default semantics
+and TMA's load offload. CUTLASS's pre-Hopper `flash_fwd_kernel.h` and
+the FlashAttention-2 repo both implement this for `sm_80`/`sm_86`/`sm_89`;
+the code is ~3-4× the size of M10.7 and split into producer/consumer
+warp roles.
+
+See Module 7 §7 for the broader Hopper-successor story; M10.8 (warp
+specialization on Ada) and M10.9 (FA-3-shape kernel on H100) would be
+the natural extensions if you have an H100 in front of you.
 
 ### 13.8 Pedagogical takeaway
 

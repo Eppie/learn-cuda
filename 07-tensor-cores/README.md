@@ -315,8 +315,35 @@ H100), adds three things that change how you write a tensor-core kernel:
   the FP8 mma into one async pipeline. This is what production LLM inference
   in 2025+ runs on.
 
-You won't write Hopper code in this course (no H100 in your machine), but
-when you read CUTLASS 3.x or FlashAttention 3 source, those three primitives
+### FlashAttention-3 (2024) — what the new primitives unlock
+
+The headline application of the three Hopper primitives above is
+**FlashAttention-3** (Dao et al., 2024). FA-3's perf on H100:
+
+- FP16: **~740 TF/s** = **75%** of H100's 990 TF/s tensor peak (vs FA-2 on
+  H100 at ~550 TF/s = 55% of peak)
+- FP8: ~1.2 PF/s
+
+The +20-percentage-point efficiency over FA-2 *on the same hardware* comes
+from three things, all enabled by the primitives above:
+
+1. **WGMMA** (warp-group MMA): one warp-group (4 warps) issues one async
+   m64n64k16-sized MMA. Bigger fragments, fewer issue slots, overlap with
+   other warp-groups' work in the same SM.
+2. **TMA**: zero per-element address math. The hardware streams tiles
+   asynchronously from global to shared while warps work on other things.
+3. **Ping-pong warp-group specialization**: half the warp-groups run
+   GEMM 1 (Q·K^T) of block A while the other half run GEMM 2 (P·V) of
+   block A−1. Hides softmax behind matmuls — the bottleneck FA-2 still
+   has.
+
+**None of this hardware is on Ada (sm_89).** Module 10's optimization
+ladder ends at FA-2-shape perf because that's what the hardware allows;
+the path to FA-3 numbers is hardware, not algorithm. M10.7's writeup
+notes which FA-3 ideas (warp specialization) are *partially* expressible
+on Ada and which are Hopper-locked.
+
+When you read CUTLASS 3.x or FlashAttention 3 source, the three primitives
 are most of what's new versus CUTLASS 2 / FlashAttention 2.
 
 ## 8. Where Tensor Cores *don't* help
